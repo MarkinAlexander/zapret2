@@ -19,6 +19,7 @@ struct rawpacket
 	t_ctrack_positions tpos;
 	bool tpos_present;
 	bool server_side;		// true = reasm of packets from the server side
+	bool already_sent;		// fastpath workaround: first reasm fragment passed via VERDICT_PASS
 	TAILQ_ENTRY(rawpacket) next;
 };
 TAILQ_HEAD(rawpacket_tailhead, rawpacket);

@@ -522,6 +522,16 @@ static bool send_delayed(t_ctrack *ctrack)
 {
 	if (!rawpacket_queue_empty(&ctrack->delayed))
 	{
+		// fastpath workaround: skip packets already sent via VERDICT_PASS
+		struct rawpacket *rp = TAILQ_FIRST(&ctrack->delayed.q);
+		while (rp && rp->already_sent)
+		{
+			DLOG("skipping already_sent packet in replay\n");
+			TAILQ_REMOVE(&ctrack->delayed.q, rp, next);
+			rawpacket_free(rp);
+			rp = TAILQ_FIRST(&ctrack->delayed.q);
+		}
+		if (rawpacket_queue_empty(&ctrack->delayed)) return true;
 		DLOG("SENDING %u delayed packets\n", rawpacket_queue_count(&ctrack->delayed));
 		return rawsend_queue(&ctrack->delayed);
 	}
@@ -1587,7 +1597,10 @@ static uint8_t dpi_desync_tcp_packet_play(
 
 				if (!ReasmIsEmpty(&ps.ctrack->reasm_client))
 				{
-					if (rawpacket_queue(&ps.ctrack->delayed, &ps.dst, fwmark, desync_fwmark, ifin, ifout, dis->data_pkt, dis->len_pkt, dis->len_payload, &ps.ctrack->pos, false))
+					bool is_first = rawpacket_queue_empty(&ps.ctrack->delayed);
+
+					struct rawpacket *rp = rawpacket_queue(&ps.ctrack->delayed, &ps.dst, fwmark, desync_fwmark, ifin, ifout, dis->data_pkt, dis->len_pkt, dis->len_payload, &ps.ctrack->pos, false);
+					if (rp)
 					{
 						DLOG("DELAY desync until reasm is complete (#%u)\n", rawpacket_queue_count(&ps.ctrack->delayed));
 					}
@@ -1603,6 +1616,19 @@ static uint8_t dpi_desync_tcp_packet_play(
 					{
 						replay_queue(&ps.ctrack->delayed);
 						reasm_client_fin(ps.ctrack);
+						return VERDICT_DROP;
+					}
+					// Workaround for hardware fastpath platforms (Mediatek MT7621, Keenetic KN-1011):
+					// DROP of the first fragment triggers RTCACHE in conntrack, after which
+					// subsequent fragments bypass NFQUEUE entirely via hardware shortcut.
+					// Reasm never completes. Fix: pass first fragment via VERDICT_PASS so
+					// server ACKs it and client sends the second fragment normally.
+					// Mark it already_sent so replay does not duplicate it via raw socket.
+					if (is_first)
+					{
+						rp->already_sent = true;
+						DLOG("passing first reasm fragment via VERDICT_PASS (hardware fastpath workaround)\n");
+						return VERDICT_PASS;
 					}
 					return VERDICT_DROP;
 				}
@@ -2233,19 +2259,31 @@ static bool replay_queue(struct rawpacket_queue *q)
 		DLOG("REPLAYING delayed packet #%u offset %zu\n", i+1, offset);
 		modlen = sizeof(mod);
 		uint8_t verdict = dpi_desync_packet_play(i, count, offset, rp->fwmark_orig, rp->ifin, rp->ifout, rp->tpos_present ? &rp->tpos : NULL, rp->packet, rp->len, mod, &modlen);
-		switch (verdict & VERDICT_MASK)
+		if (rp->already_sent)
 		{
-		case VERDICT_MODIFY:
-			DLOG("SENDING delayed packet #%u modified\n", i+1);
-			b &= rawsend((struct sockaddr*)&rp->dst,rp->fwmark,rp->ifout,mod,modlen);
-			break;
-		case VERDICT_PASS:
-			DLOG("SENDING delayed packet #%u unmodified\n", i+1);
-			b &= rawsend_rp(rp);
-			break;
-		case VERDICT_DROP:
-			DLOG("DROPPING delayed packet #%u\n", i+1);
-			break;
+			// fastpath workaround: the packet itself was already sent by the kernel via VERDICT_PASS.
+			// the play call above is still required: lua strategies act on the first replay piece
+			// and send the whole reassembled payload themselves (rawsend side effects), and replay
+			// state (replay_drop, replay_piece_last) must be maintained. suppress only the queued
+			// packet send so it is not duplicated.
+			DLOG("delayed packet #%u already sent via VERDICT_PASS, suppressing queued replay\n", i+1);
+		}
+		else
+		{
+			switch (verdict & VERDICT_MASK)
+			{
+			case VERDICT_MODIFY:
+				DLOG("SENDING delayed packet #%u modified\n", i+1);
+				b &= rawsend((struct sockaddr*)&rp->dst,rp->fwmark,rp->ifout,mod,modlen);
+				break;
+			case VERDICT_PASS:
+				DLOG("SENDING delayed packet #%u unmodified\n", i+1);
+				b &= rawsend_rp(rp);
+				break;
+			case VERDICT_DROP:
+				DLOG("DROPPING delayed packet #%u\n", i+1);
+				break;
+			}
 		}
 
 		if (!bseq)
