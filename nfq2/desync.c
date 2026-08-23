@@ -602,6 +602,22 @@ static void reasm_client_cancel(t_ctrack *ctrack)
 {
 	reasm_client_stop(ctrack, "reassemble session cancelled\n");
 }
+// cancel reasm and DISCARD the delayed queue without sending it.
+// used when the hardware fastpath steals further fragments: the queued originals
+// must not leak out unmodified (the DPI would see the real SNI). the client is
+// retransmitting the held data anyway and the retransmission is processed through
+// the normal desync path instead.
+static void reasm_client_cancel_discard(t_ctrack *ctrack)
+{
+	if (ctrack)
+	{
+		ReasmClear(&ctrack->reasm_client);
+		ctrack->reasm_client_payload = L7P_UNKNOWN;
+		rawpacket_queue_destroy(&ctrack->delayed);
+		rawpacket_queue_init(&ctrack->delayed, RAW_PACKET_QUEUE_DELAYED_MAX);
+		DLOG("reassemble session cancelled, delayed packets discarded\n");
+	}
+}
 static void reasm_client_fin(t_ctrack *ctrack)
 {
 	reasm_client_stop(ctrack, "reassemble session finished\n");
@@ -1622,16 +1638,17 @@ static uint8_t dpi_desync_tcp_packet_play(
 			{
 				// hardware fastpath fallback: a retransmission of already buffered data means
 				// the remaining reasm fragments are not reaching NFQUEUE (FASTNAT/RTCACHE
-				// steals them) and the server has received nothing while we hold the original.
-				// abort the reasm workaround: cancel it (send_delayed delivers the queued
-				// originals, the server finally receives the first fragment) and process this
-				// packet through the normal desync path. the client will re-send the missing
-				// fragments, they pass as unclassified payload and the server completes the
-				// ClientHello. graceful degradation for flows stolen by hardware fastpath.
+				// steals them; the dup-ACK storm proves the fastpath itself already delivered
+				// them to the server out of order). discard the reasm and the queued originals
+				// WITHOUT sending them - they must not leak unmodified, the DPI would see the
+				// real SNI. the retransmitted packet is processed through the normal desync
+				// path with regular single packet semantics: split positions inside the first
+				// fragment still resolve (SNI is almost always there). flows with SNI in the
+				// stolen fragments can not be desynced - those bytes never reach NFQUEUE.
 				if (is_retransmission(&ps.ctrack->pos.client))
 				{
-					DLOG("retransmission while reasm is incomplete (fastpath steals further fragments). cancelling reasm\n");
-					reasm_client_cancel(ps.ctrack);
+					DLOG("retransmission while reasm is incomplete (fastpath steals further fragments). discarding reasm, falling back to single packet desync\n");
+					reasm_client_cancel_discard(ps.ctrack);
 					goto rediscover;
 				}
 
