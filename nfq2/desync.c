@@ -522,16 +522,6 @@ static bool send_delayed(t_ctrack *ctrack)
 {
 	if (!rawpacket_queue_empty(&ctrack->delayed))
 	{
-		// fastpath workaround: skip packets already sent via VERDICT_PASS
-		struct rawpacket *rp = TAILQ_FIRST(&ctrack->delayed.q);
-		while (rp && rp->already_sent)
-		{
-			DLOG("skipping already_sent packet in replay\n");
-			TAILQ_REMOVE(&ctrack->delayed.q, rp, next);
-			rawpacket_free(rp);
-			rp = TAILQ_FIRST(&ctrack->delayed.q);
-		}
-		if (rawpacket_queue_empty(&ctrack->delayed)) return true;
 		DLOG("SENDING %u delayed packets\n", rawpacket_queue_count(&ctrack->delayed));
 		return rawsend_queue(&ctrack->delayed);
 	}
@@ -615,6 +605,39 @@ static void reasm_client_cancel(t_ctrack *ctrack)
 static void reasm_client_fin(t_ctrack *ctrack)
 {
 	reasm_client_stop(ctrack, "reassemble session finished\n");
+}
+
+
+// hardware fastpath workaround helper: build payload-less TCP ACK from the dissected packet.
+// preserves L3/L4 headers and TCP options, removes payload, fixes lengths and checksums.
+// the ACK does not occupy sequence space and reveals no payload bytes.
+static bool make_tcp_ack_only(const struct dissect *dis, uint8_t *mod_pkt, size_t *len_mod_pkt)
+{
+	if (!dis || !dis->tcp || (!dis->ip && !dis->ip6)) return false;
+
+	size_t len = dis->len_l3 + dis->len_l4; // all L3 headers (incl. ip6 ext) + TCP header with options
+	if (*len_mod_pkt < len) return false;
+	memcpy(mod_pkt, dis->data_pkt, len);
+
+	struct tcphdr *tcp = (struct tcphdr *)(mod_pkt + dis->len_l3);
+	tcp->th_flags &= ~TH_PUSH; // PSH without payload is meaningless
+
+	if (dis->ip)
+	{
+		struct ip *ip = (struct ip *)mod_pkt;
+		ip->ip_len = htons((uint16_t)len);
+		ip->ip_sum = 0;
+		ip4_fix_checksum(ip);
+	}
+	else
+	{
+		struct ip6_hdr *ip6 = (struct ip6_hdr *)mod_pkt;
+		ip6->ip6_ctlun.ip6_un1.ip6_un1_plen = htons((uint16_t)(len - sizeof(struct ip6_hdr)));
+	}
+	tcp_fix_checksum(tcp, dis->len_l4, (struct ip *)mod_pkt, (struct ip6_hdr *)mod_pkt);
+
+	*len_mod_pkt = len;
+	return true;
 }
 
 
@@ -1618,19 +1641,27 @@ static uint8_t dpi_desync_tcp_packet_play(
 						reasm_client_fin(ps.ctrack);
 						return VERDICT_DROP;
 					}
-					// Workaround for hardware fastpath platforms (Mediatek MT7621, Keenetic KN-1011):
-					// DROP of the first fragment triggers RTCACHE in conntrack, after which
-					// subsequent fragments bypass NFQUEUE entirely via hardware shortcut.
-					// Reasm never completes. Fix: pass first fragment via VERDICT_PASS so
-					// server ACKs it and client sends the second fragment normally.
-					// Mark it already_sent so replay does not duplicate it via raw socket.
-					if (is_first)
+				// Workaround for hardware fastpath platforms (Mediatek MT7621, Keenetic KN-1011):
+				// DROP of the first fragment triggers RTCACHE in conntrack, after which
+				// subsequent fragments bypass NFQUEUE entirely via hardware shortcut.
+				// Reasm never completes. Fix: replace the first fragment with a payload-less
+				// TCP ACK (VERDICT_MODIFY keeps NF_ACCEPT semantics so the flow stays on the
+				// slow path). No ClientHello bytes leak to the server or DPI and no TCP
+				// sequence space is occupied. The full desynced payload is delivered by the
+				// strategy during replay. The original packet stays in the delayed queue for
+				// logical replay; only its resend is suppressed.
+				if (is_first)
+				{
+					rp->suppress_replay_send = true;
+					if (make_tcp_ack_only(dis, mod_pkt, len_mod_pkt))
 					{
-						rp->already_sent = true;
-						DLOG("passing first reasm fragment via VERDICT_PASS (hardware fastpath workaround)\n");
-						return VERDICT_PASS;
+						DLOG("replacing first reasm fragment with ACK-only packet (hardware fastpath workaround)\n");
+						return VERDICT_MODIFY | VERDICT_NOCSUM;
 					}
+					DLOG_ERR("failed to build ACK-only reasm placeholder. dropping\n");
 					return VERDICT_DROP;
+				}
+				return VERDICT_DROP;
 				}
 			}
 			ps.bHaveHost = TLSHelloExtractHost(rdata_payload, rlen_payload, ps.host, sizeof(ps.host), true);
@@ -2259,14 +2290,14 @@ static bool replay_queue(struct rawpacket_queue *q)
 		DLOG("REPLAYING delayed packet #%u offset %zu\n", i+1, offset);
 		modlen = sizeof(mod);
 		uint8_t verdict = dpi_desync_packet_play(i, count, offset, rp->fwmark_orig, rp->ifin, rp->ifout, rp->tpos_present ? &rp->tpos : NULL, rp->packet, rp->len, mod, &modlen);
-		if (rp->already_sent)
+		if (rp->suppress_replay_send)
 		{
-			// fastpath workaround: the packet itself was already sent by the kernel via VERDICT_PASS.
-			// the play call above is still required: lua strategies act on the first replay piece
-			// and send the whole reassembled payload themselves (rawsend side effects), and replay
-			// state (replay_drop, replay_piece_last) must be maintained. suppress only the queued
-			// packet send so it is not duplicated.
-			DLOG("delayed packet #%u already sent via VERDICT_PASS, suppressing queued replay\n", i+1);
+			// fastpath workaround: the packet itself was replaced in-flight with an ACK-only
+			// placeholder (VERDICT_MODIFY). the play call above is still required: lua strategies
+			// act on the first replay piece and send the whole reassembled payload themselves
+			// (rawsend side effects), and replay state (replay_drop, replay_piece_last) must be
+			// maintained. suppress only the queued packet send: its payload must never be sent.
+			DLOG("delayed packet #%u replaced by ACK-only placeholder, suppressing queued replay\n", i+1);
 		}
 		else
 		{
