@@ -5,24 +5,23 @@
 
 ## 1. zator config.default: graceful degradation клон-стратегий
 
-Статус: отложено пользователем. Из всего плана приемлем только `:optional`;
-`fallback=fake_default_tls` отклонён — теряет суть «фейков из реальных данных».
+Статус: ПРИМЕНЕНО (ветка zator, коммит cec2ff7) — вариант с
+`fallback=fake_default_tls`. `:optional` отклонён автором затора.
 
 Контекст: клон-стратегии 31–36, 39, 42 (`tls_client_hello_clone:blob=clone_vk/...`
-→ `fake:blob=clone_*` → `multisplit`) падают с
+→ `fake:blob=clone_*` → `multisplit`) падали с
 `LUA ERROR: zapret-lib.lua:553: blob 'clone_vk' unavailable` +
 `desync ERROR. passing packet unmodified.`, если клонирование не удалось
 (фрагментированный ClientHello без reasm-данных: внеочередные фрагменты,
-отменённый/выключенный реасм, малое окно сервера).
+отменённый/выключенный реасм, малое окно сервера, старый nfqws2 без
+реасм-фиксов).
 
-Запасной фикс (одна строка на стратегию, config.default строки 139–144, 147, 150):
-добавить `:optional` потребителям блоба — `fake:blob=clone_vk:optional:...`,
-`fakemultidisorder:fake_blob=clone_vk_fmd:optional:...` (39),
-`fakemultisplit:fake_blob=clone_hcaptcha_fms:optional:...` (42).
-Тогда при неудачном клоне фейк пропускается с DLOG, а multisplit в хвосте
-цепочки выполняется; LUA ERROR исчезает. Поддержка `optional` уже есть:
-zapret-antidpi.lua:457–459 (fake), orchestra/locked.lua:400–407
-(fakemultidisorder) и :556–563 (fakemultisplit).
+Применённый фикс: в config.default (строки 139–144, 147, 150) каждый шаг
+`tls_client_hello_clone:blob=clone_*` получил `:fallback=fake_default_tls`
+(поддержка в zapret-antidpi.lua:384–387). При неудачном клоне блоб
+подменяется встроенным fake_default_tls — LUA ERROR исчезает, стратегия
+(модификаторы + multisplit) продолжает работать на любой версии zapret2
+с поддержкой аргумента fallback.
 
 ## 2. zapret2 lua: частичное клонирование ClientHello
 
