@@ -1618,9 +1618,24 @@ static uint8_t dpi_desync_tcp_packet_play(
 						goto rediscover;
 				}
 
-				if (!ReasmIsEmpty(&ps.ctrack->reasm_client))
+			if (!ReasmIsEmpty(&ps.ctrack->reasm_client))
+			{
+				// hardware fastpath fallback: a retransmission of already buffered data means
+				// the remaining reasm fragments are not reaching NFQUEUE (FASTNAT/RTCACHE
+				// steals them) and the server has received nothing while we hold the original.
+				// abort the reasm workaround: cancel it (send_delayed delivers the queued
+				// originals, the server finally receives the first fragment) and process this
+				// packet through the normal desync path. the client will re-send the missing
+				// fragments, they pass as unclassified payload and the server completes the
+				// ClientHello. graceful degradation for flows stolen by hardware fastpath.
+				if (is_retransmission(&ps.ctrack->pos.client))
 				{
-					bool is_first = rawpacket_queue_empty(&ps.ctrack->delayed);
+					DLOG("retransmission while reasm is incomplete (fastpath steals further fragments). cancelling reasm\n");
+					reasm_client_cancel(ps.ctrack);
+					goto rediscover;
+				}
+
+				bool is_first = rawpacket_queue_empty(&ps.ctrack->delayed);
 
 					struct rawpacket *rp = rawpacket_queue(&ps.ctrack->delayed, &ps.dst, fwmark, desync_fwmark, ifin, ifout, dis->data_pkt, dis->len_pkt, dis->len_payload, &ps.ctrack->pos, false);
 					if (rp)
