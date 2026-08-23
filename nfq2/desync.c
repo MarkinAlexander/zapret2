@@ -2293,11 +2293,27 @@ static bool replay_queue(struct rawpacket_queue *q)
 		if (rp->suppress_replay_send)
 		{
 			// fastpath workaround: the packet itself was replaced in-flight with an ACK-only
-			// placeholder (VERDICT_MODIFY). the play call above is still required: lua strategies
-			// act on the first replay piece and send the whole reassembled payload themselves
-			// (rawsend side effects), and replay state (replay_drop, replay_piece_last) must be
-			// maintained. suppress only the queued packet send: its payload must never be sent.
-			DLOG("delayed packet #%u replaced by ACK-only placeholder, suppressing queued replay\n", i+1);
+			// placeholder (VERDICT_MODIFY), so its payload was not delivered by the kernel.
+			// the play call above is still required: lua strategies act on the first replay
+			// piece and send the whole reassembled payload themselves (rawsend side effects),
+			// and replay state (replay_drop, replay_piece_last) must be maintained.
+			// suppress the queued resend only on DROP verdict (the strategy has sent the data
+			// itself). on PASS/MODIFY nothing has delivered the payload yet - resend it,
+			// otherwise the server never receives those bytes and the connection stalls.
+			switch (verdict & VERDICT_MASK)
+			{
+			case VERDICT_MODIFY:
+				DLOG("SENDING delayed packet #%u modified (ACK-only placeholder was sent in-flight)\n", i+1);
+				b &= rawsend((struct sockaddr*)&rp->dst,rp->fwmark,rp->ifout,mod,modlen);
+				break;
+			case VERDICT_PASS:
+				DLOG("SENDING delayed packet #%u unmodified (ACK-only placeholder was sent in-flight)\n", i+1);
+				b &= rawsend_rp(rp);
+				break;
+			case VERDICT_DROP:
+				DLOG("delayed packet #%u replaced by ACK-only placeholder, suppressing queued replay\n", i+1);
+				break;
+			}
 		}
 		else
 		{
