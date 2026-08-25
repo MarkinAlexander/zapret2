@@ -330,3 +330,4 @@ v0.9.4.3
 * nfqws2: negate SSID/NLM filters
 * nfqws2: desync function can explicitly return nil as a synonym of VERDICT_PASS
 * zapret-lub: luaexec now passes returned verdict code
+* blockcheck2: fix script crash on bad strategies from the file in custom/10-list.sh

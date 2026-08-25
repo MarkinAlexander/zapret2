@@ -2157,7 +2157,7 @@ static bool lua_reconstruct_tcphdr_options(lua_State *L, int idx, struct tcphdr 
 		lua_Integer idx=0;
 		uint8_t *p, *data = (uint8_t*)(tcp+1);
 		size_t l, left;
-		uint8_t kind;
+		uint8_t kind, pad;
 
 	 	left = *len - filled;
 		if (left>40) left=40; // max size of tcp options
@@ -2185,9 +2185,6 @@ static bool lua_reconstruct_tcphdr_options(lua_State *L, int idx, struct tcphdr 
 				switch(kind)
 				{
 					case TCP_KIND_END:
-						*data = kind; data++; left--; filled++;
-						lua_pop(L, 1);
-						goto end;
 					case TCP_KIND_NOOP:
 						*data = kind; data++; left--; filled++;
 						break;
@@ -2208,12 +2205,10 @@ static bool lua_reconstruct_tcphdr_options(lua_State *L, int idx, struct tcphdr 
 				lua_pop(L, 1);
 			}
 		}
-end:
-		while(filled & 3)
-		{
-			if (!left) goto err;
-			*data = TCP_KIND_NOOP; data++; left--; filled++;
-		}
+		pad = (4-(filled & 3)) & 3;
+		if (left<pad) goto err;
+		memset(data,0,pad);
+		filled+=pad;
 	}
 
 	tcp->th_off = filled>>2;
