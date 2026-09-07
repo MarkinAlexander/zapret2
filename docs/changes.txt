@@ -334,6 +334,6 @@ v0.9.4.3
 * zapret-lib: luaexec now passes returned verdict code
 * blockcheck2: fix script crash on bad strategies from the file in custom/10-list.sh
 
-1.0.6
+1.0.5.1
 
 * nfqws2: optimize profile search. fast checks first
