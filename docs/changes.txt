@@ -330,5 +330,10 @@ v0.9.4.3
 * nfqws2: negate SSID/NLM filters
 * nfqws2: desync function can explicitly return nil as a synonym of VERDICT_PASS
 * nfqws2: pad tcp options with 0x00 in reconstruct. strip 0x00 ending options in dissect.
+* nfqws2: --filter-mark
 * zapret-lib: luaexec now passes returned verdict code
 * blockcheck2: fix script crash on bad strategies from the file in custom/10-list.sh
+
+1.0.6
+
+* nfqws2: optimize profile search. fast checks first

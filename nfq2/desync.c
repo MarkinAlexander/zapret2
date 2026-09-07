@@ -216,10 +216,19 @@ static bool dp_match(
 
 	if (bCheckDone) *bCheckDone = false;
 
-	if (!HostlistsReloadCheckForProfile(dp)) return false;
+	// fast checks first
+
+#ifdef __linux__
+	if ((fwmark & dp->filter_mark_mask)!=dp->filter_mark)
+		return false;
+#endif
 
 	if ((ip && !dp->filter_ipv4) || (ip6 && !dp->filter_ipv6))
 		// L3 filter does not match
+		return false;
+
+	if (!l7_proto_match(l7proto, dp->filter_l7))
+		// L7 filter does not match
 		return false;
 
 	switch(l3proto)
@@ -238,17 +247,12 @@ static bool dp_match(
 			if (!ipp_filters_match(&dp->ipf, l3proto)) return false;
 	}
 
-	if (!l7_proto_match(l7proto, dp->filter_l7))
-		// L7 filter does not match
-		return false;
-#ifdef __linux__
-	if ((fwmark & dp->filter_mark_mask)!=dp->filter_mark)
-		return false;
-#endif
 #ifdef HAS_FILTER_SSID
 	if (!LIST_EMPTY(&dp->filter_ssid) && (!strlist_search(&dp->filter_ssid, ssid) ^ dp->filter_ssid_neg))
 		return false;
 #endif
+
+	if (!HostlistsReloadCheckForProfile(dp)) return false;
 
 	bHostlistsEmpty = PROFILE_HOSTLISTS_EMPTY(dp);
 	if (!dp->hostlist_auto && !hostname && !bHostlistsEmpty)
