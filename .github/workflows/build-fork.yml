@@ -1,0 +1,184 @@
+name: build-fork
+
+# Сборка бинарников zapret2 из ветки форка по официальному рецепту
+# bol-van (.github/workflows/build.yml): тулчейны bol-van/musl-cross,
+# LuaJIT (openresty, пин 2.1-20250826) или классическая Lua 5.5.1 на
+# x86/riscv64, -Oz LTO статика, UPX как в официальных релизах.
+# Запуск: workflow_dispatch на нужной ветке. Версия nfqws2 берётся из
+# input version (по умолчанию v1.0.5.1-reasm-fix), хеш - короткий sha.
+# Релиз bin-<версия> с архивом binaries-<версия>.tar.gz + sha256sum.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия для nfqws2 --version (и тега релиза bin-...)'
+        required: false
+        default: 'v1.0.5.1-reasm-fix'
+      make_release:
+        description: 'Создать релиз bin-<версия>'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  tool: x86_64-unknown-linux-musl,   lua: luajit }
+          - { arch: x86,      tool: i586-unknown-linux-musl,     lua: lua }
+          - { arch: arm64,    tool: aarch64-unknown-linux-musl,  lua: luajit }
+          - { arch: arm,      tool: armv6-unknown-linux-musleabi, lua: luajit }
+          - { arch: mips64,   tool: mips64-unknown-linux-musl,   lua: luajit }
+          - { arch: mipsel64, tool: mips64el-unknown-linux-musl, lua: luajit }
+          - { arch: mipsel,   tool: mipsel-unknown-linux-muslsf, lua: luajit }
+          - { arch: mips,     tool: mips-unknown-linux-muslsf,   lua: luajit }
+          - { arch: ppc,      tool: powerpc-unknown-linux-musl,  lua: luajit }
+          - { arch: riscv64,  tool: riscv64-unknown-linux-musl,  lua: lua }
+    env:
+      LUA_RELEASE: 5.5.1
+      LUAJIT_RELEASE: 2.1-20250826
+      MINSIZE: -flto=auto -ffunction-sections -fdata-sections
+      LDMINSIZE: -Wl,--gc-sections -flto=auto
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up toolchain
+        env:
+          TOOL: ${{ matrix.tool }}
+        run: |
+          sudo apt-get update -qq
+          # luajit buildvm требует 32-битный хост-компилятор для 32-битных целей
+          sudo apt-get install -y -qq pigz libcap-dev libc6-dev gcc-multilib
+          mkdir -p "$HOME/tools"
+          curl -fsSL "https://github.com/bol-van/musl-cross/releases/download/latest/${TOOL}.tar.xz" | tar -xJ -C "$HOME/tools"
+          echo "$HOME/tools/${TOOL}/bin" >> "$GITHUB_PATH"
+
+      - name: Set up upx
+        run: |
+          curl -fsSL -o upx4.tar.xz https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz
+          curl -fsSL -o upx5.tar.xz https://github.com/upx/upx/releases/download/v5.1.0/upx-5.1.0-amd64_linux.tar.xz
+          tar -xJf upx4.tar.xz && tar -xJf upx5.tar.xz
+
+      - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.tool }}
+          LUAMODE: ${{ matrix.lua }}
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -n "$VERSION" ] || VERSION="$GITHUB_REF_NAME"
+          DEPS_DIR="$GITHUB_WORKSPACE/deps"
+          export CC="$TARGET-gcc" LD="$TARGET-ld" AR="$TARGET-ar" NM="$TARGET-nm" STRIP="$TARGET-strip"
+          export PKG_CONFIG_PATH="$DEPS_DIR/lib/pkgconfig"
+          OPTIMIZE=-Oz
+          SYSMALLOC=-DLUAJIT_USE_SYSMALLOC
+          CPU=""
+          case "$ARCH" in
+            arm)  CPU="-mcpu=arm1176jzf-s -mthumb" ;;
+            arm64|mips64|mipsel64) SYSMALLOC= ;;
+          esac
+          MINSIZE="$OPTIMIZE $MINSIZE"
+
+          if [ "$LUAMODE" = lua ]; then
+            curl -fsSL "https://www.lua.org/ftp/lua-${LUA_RELEASE}.tar.gz" | tar -xz
+            ( cd lua-*/
+              make CC="$CC" AR="$AR rc" CFLAGS="$CPU $MINSIZE" LDFLAGS="$LDMINSIZE" linux -j"$(nproc)"
+              make install INSTALL_TOP="$DEPS_DIR" INSTALL_BIN="$DEPS_DIR/bin" \
+                INSTALL_INC="$DEPS_DIR/include/lua5.5" INSTALL_LIB="$DEPS_DIR/lib" )
+            LJIT=0
+            LCFLAGS="-I$DEPS_DIR/include/lua5.5"
+            LLIB="-L$DEPS_DIR/lib -llua"
+          else
+            curl -fsSL "https://github.com/openresty/luajit2/archive/refs/tags/v${LUAJIT_RELEASE}.tar.gz" | tar -xz
+            case "$ARCH" in x86_64|arm64|mips64|mipsel64) HOSTCC="cc" ;; *) HOSTCC="cc -m32" ;; esac
+            ( cd luajit2-*/
+              make BUILDMODE=static XCFLAGS="$SYSMALLOC -DLUAJIT_DISABLE_FFI" HOST_CC="$HOSTCC" \
+                CROSS= CC="$CC" TARGET_AR="$AR rcus" TARGET_STRIP="$STRIP" \
+                TARGET_CFLAGS="$CPU $MINSIZE" TARGET_LDFLAGS="$CPU $LDMINSIZE" -j"$(nproc)"
+              make install PREFIX= DESTDIR="$DEPS_DIR" )
+            LJIT=1
+            LCFLAGS="-I$DEPS_DIR/include/luajit-2.1"
+            LLIB="-L$DEPS_DIR/lib -lluajit-5.1"
+          fi
+
+          for i in libnfnetlink-1.0.2 libmnl-1.0.5 libnetfilter_queue-1.0.5; do
+            curl -fsSL "https://www.netfilter.org/pub/${i%%-*}/$i.tar.bz2" | tar -xj
+            ( cd "$i"*/
+              CFLAGS="$CPU $MINSIZE" LDFLAGS="$LDMINSIZE" \
+              ./configure --prefix= --host="$TARGET" --enable-static --disable-shared --disable-dependency-tracking
+              make install -j"$(nproc)" DESTDIR="$DEPS_DIR" )
+            sed -i "s|^prefix=.*|prefix=$DEPS_DIR|g" "$DEPS_DIR/lib/pkgconfig/${i%%-*}.pc"
+          done
+
+          ZTAG=$(gh api repos/madler/zlib/releases/latest --jq '.tag_name')
+          curl -fsSL "https://github.com/madler/zlib/archive/refs/tags/$ZTAG.tar.gz" | tar -xz
+          ( cd zlib-*/
+            CFLAGS="$CPU $MINSIZE" ./configure --prefix= --static
+            make install -j"$(nproc)" DESTDIR="$DEPS_DIR" )
+
+          install -Dm644 -t "$DEPS_DIR/include/sys" \
+            /usr/include/x86_64-linux-gnu/sys/queue.h /usr/include/sys/capability.h
+
+          CFLAGS="-DZAPRET_GH_VER=$VERSION -DZAPRET_GH_HASH=${GITHUB_SHA:0:8} -static-libgcc -I$DEPS_DIR/include $CPU" \
+          LDFLAGS="-L$DEPS_DIR/lib" \
+          make CFLAGS_PIC= LDFLAGS_PIE=-static LUA_JIT="$LJIT" \
+            LUA_CFLAGS="$LCFLAGS" LUA_LIB="$LLIB" -j"$(nproc)"
+
+          # UPX как в официальном release-джобе
+          case "$ARCH" in
+            mips64|mipsel64) ;;
+            riscv64) upx-5.1.0-amd64_linux/upx --best --lzma binaries/my/* || true ;;
+            *)       upx-4.2.4-amd64_linux/upx --best --lzma binaries/my/* || true ;;
+          esac
+
+          # проверка версии до упаковки не выходит: строка формата и значение
+          grep -aq "github version" binaries/my/nfqws2
+          grep -aq "$VERSION" binaries/my/nfqws2
+
+          mkdir -p "out/linux-$ARCH"
+          cp binaries/my/nfqws2 binaries/my/ip2net binaries/my/mdig "out/linux-$ARCH/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    if: ${{ inputs.make_release }}
+    needs: build-linux
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          pattern: linux-*
+          merge-multiple: true
+
+      - name: Pack
+        run: |
+          [ -n "$VERSION" ] || VERSION="$GITHUB_REF_NAME"
+          ( cd binaries && find . -type f -exec sha256sum {} \; > ../sha256sum.txt )
+          tar -czf "binaries-$VERSION.tar.gz" -C binaries .
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bin-${{ inputs.version || github.ref_name }}
+          fail_on_unmatched_files: true
+          body: |
+            Бинарники zapret2 из ветки ${{ github.ref_name }} (коммит ${{ github.sha }})
+            10 архитектур, сборка по официальному рецепту bol-van.
+          files: |
+            binaries-*.tar.gz
+            sha256sum.txt
