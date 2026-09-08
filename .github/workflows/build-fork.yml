@@ -483,7 +483,8 @@ jobs:
           )
           tar --owner=0 --group=0 -c ${{ env.repo_dir }} | pigz -11 >${{ env.repo_dir }}-openwrt-embedded.tar.gz
           # отдельный архив linux-бинарников для zapret2-keenetic-binaries
-          tar -czf binaries-${{ env.VERSION }}.tar.gz -C ${{ env.repo_dir }}/binaries linux-*
+          ( cd ${{ env.repo_dir }}/binaries && \
+            tar -czf "$GITHUB_WORKSPACE/binaries-${{ env.VERSION }}.tar.gz" linux-* )
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
