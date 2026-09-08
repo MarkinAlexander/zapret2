@@ -133,16 +133,16 @@ jobs:
           make CFLAGS_PIC= LDFLAGS_PIE=-static LUA_JIT="$LJIT" \
             LUA_CFLAGS="$LCFLAGS" LUA_LIB="$LLIB" -j"$(nproc)"
 
+          # проверка версии ДО упаковки: после UPX строки в бинарнике не ищутся
+          grep -aq "github version" binaries/my/nfqws2
+          grep -aq "$VERSION" binaries/my/nfqws2
+
           # UPX как в официальном release-джобе
           case "$ARCH" in
             mips64|mipsel64) ;;
             riscv64) upx-5.1.0-amd64_linux/upx --best --lzma binaries/my/* || true ;;
             *)       upx-4.2.4-amd64_linux/upx --best --lzma binaries/my/* || true ;;
           esac
-
-          # проверка версии до упаковки не выходит: строка формата и значение
-          grep -aq "github version" binaries/my/nfqws2
-          grep -aq "$VERSION" binaries/my/nfqws2
 
           mkdir -p "out/linux-$ARCH"
           cp binaries/my/nfqws2 binaries/my/ip2net binaries/my/mdig "out/linux-$ARCH/"
