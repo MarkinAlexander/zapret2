@@ -84,6 +84,7 @@
       - [standard rawsend](#standard-rawsend)
     - [Dissection and reconstruction](#dissection-and-reconstruction)
       - [dissect](#dissect)
+      - [dissect_hdr](#dissect_hdr)
       - [reconstruct_dissect](#reconstruct_dissect)
       - [reconstruct_hdr](#reconstruct_hdr)
       - [csum_fix](#csum_fix)
@@ -711,6 +712,7 @@ Specific parameters for nfqws2:
  --bind-fix4                            ; fix for the issue where generated packets on Linux exit from the wrong interface when using PBR (IPv4)
  --bind-fix6                            ; same as above for IPv6
  --fwmark=<int|0xHEX>                   ; mark bit to prevent looping. default = 0x40000000
+ --filter-mark=mark[/mask]              ; profile filter: filter by packet mark. mark and mask can be decimal or 0xHEX
  --filter-ssid=ssid1[,ssid2,ssid3,...]  ; profile filter: WiFi network name (SSID)
  --filter-ssid-neg=[0|1]                ; profile filter: negate SSID filter
 ```
@@ -1053,6 +1055,10 @@ A blob is a binary data block of any size that can be loaded into a Lua variable
 - `0xHEX` – loading from a HEX string.
 
 Direct file operations from Lua code are not recommended unless absolutely necessary. Lua code runs with restricted privileges; intended operations might fail or behave inconsistently across different operating systems and environments. Blob loading occurs before entering the sandbox, providing a higher chance of success.
+
+Since a blob's name is a Lua variable name, you cannot name it arbitrarily. You must follow Lua naming conventions.
+For example, a variable name cannot start with a digit, contain non-alphanumeric characters (other than `_`), or use reserved words.
+Names are case-sensitive.
 
 ### In-profile filters
 
@@ -2150,6 +2156,20 @@ Returns a table representing the dissection of the `raw_ip` packet.
 This is the same operation that occurs automatically before desync functions are called based on the profile.
 Those functions receive an already prepared dissect.
 
+#### dissect_hdr
+
+```
+function dissect_tcphdr(tcp)
+function dissect_udphdr(udp)
+function dissect_icmphdr(icmp)
+function dissect_iphdr(ip)
+function dissect_ip6hdr(ip6)
+```
+
+Dissection of individual raw headers.
+Returns a table representing the dissected header.
+For TCP options, all 0x00 options (padding) at the end are trimmed.
+
 #### reconstruct_dissect
 
 ```
@@ -2187,6 +2207,7 @@ Reconstructs the corresponding raw headers from the dissect tables. Returns the 
 - IPv6 reconstruction utilizes `reconstruct_opts`, specifically `ip6_preserve_next` and `ip6_last_proto`.
 - The IP header checksum is calculated automatically since it does not depend on any other components.
 - TCP, UDP and ICMP checksums are not calculated automatically because they depend on other components.
+- TCP options are padded with 0x00 to a multiple of 4 bytes.
 
 #### csum_fix
 

@@ -103,7 +103,7 @@ again:
 	{
 		if (bt >= elem->bt_next)
 		{
-			if (name = strdup(elem->str))
+			if ((name = strdup(elem->str)))
 			{
 				n = elem->n;
 
