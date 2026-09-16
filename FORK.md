@@ -119,8 +119,9 @@ git push -u origin build/v$V-reasm-fix
   `sha256sum.txt`) + `binaries-v$V-reasm-fix.tar.gz` для keenetic-репо;
 - создаст тег `v$V-reasm-fix` и релиз с русским описанием фикса.
 
-Проверка релиза: *Releases → v$V-reasm-fix*, 6 ассетов, sha256 на месте.
-Подтянуть тег: `git fetch origin --tags`.
+Проверка релиза: *Releases → v$V-reasm-fix*, 5 ассетов (`tar.gz`, `.zip`,
+`-openwrt-embedded.tar.gz`, `binaries-*.tar.gz`, `sha256sum.txt`), sha256 на месте.
+Тег должен стоять на вершине build-ветки: `git fetch origin --tags && git log --oneline -1 v$V-reasm-fix`.
 
 ### 6. Обновить PR-ветку (пока PR не смержили)
 
@@ -142,6 +143,10 @@ git push --force-with-lease origin feature-reasm-autodetect
   от вершины (зеркало).
 - **`binaries/linux-*`, `*.rar`, `dubug*.log` — untracked-мусор**, не коммитить.
 - **UPX затирает строки** — версию проверять в CI до упаковки (шаг уже есть).
+- **Тег релиза** — шаг «Ensure release tag» в workflow сам пушит тег на
+  GITHUB_SHA build-ветки. До фикса 2026-09-16 softprops создавал отсутствующий
+  тег на default branch (master, без фикса) — если тег где-то создан неверно,
+  удалить релиз+тег и перезапустить workflow.
 - **Force-push — только `--force-with-lease`**, и никогда — в PR-ветку автора.
 - **Не мержить upstream в master** — только reset; иначе вернётся устаревшая
   итерация фикса и конфликты в desync.c (уже проходили, вычищено 2026-09-16).
@@ -150,6 +155,6 @@ git push --force-with-lease origin feature-reasm-autodetect
 
 | Дата | Что сделали |
 |---|---|
-| 2026-09-16 | Подтянут v1.0.5.2: master сброшен на зеркало upstream, собрана ветка `build/v1.0.5.2-reasm-fix` (cherry-pick без конфликтов), PR #303 ребейзнут (mergeable clean), релиз `v1.0.5.2-reasm-fix`. |
+| 2026-09-16 | Подтянут v1.0.5.2: master сброшен на зеркало upstream, собрана ветка `build/v1.0.5.2-reasm-fix` (cherry-pick без конфликтов), PR #303 ребейзнут (mergeable clean), релиз `v1.0.5.2-reasm-fix` (пересоздан после фикса тега в workflow: f05aa94). |
 | 2026-09-08 | Релиз `v1.0.5.1-reasm-fix` с чистыми коммитами `47a0aa3`+`6348d39`. |
 | 2026-09-01 | Открыт PR #303. |
