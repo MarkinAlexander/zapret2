@@ -390,6 +390,14 @@ jobs:
         with:
           path: ${{ env.repo_dir }}
 
+      # softprops без существующего тега создаёт его на default branch (master),
+      # а не на вершине build-ветки — сначала пушим тег сами на GITHUB_SHA
+      - name: Ensure release tag on this commit
+        run: |
+          cd ${{ env.repo_dir }}
+          git tag -f "$VERSION" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$VERSION"
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         id: bins
