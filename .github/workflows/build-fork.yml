@@ -17,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Версия релиза (тег + ZAPRET_GH_VER), например v1.0.5.2-reasm-fix'
+        description: 'Версия релиза (тег + ZAPRET_GH_VER), например v1.0.5.2-reasm-fix2'
         required: false
-        default: 'v1.0.5.2-reasm-fix'
+        default: 'v1.0.5.2-reasm-fix2'
       make_release:
         description: 'Опубликовать релиз'
         type: boolean
