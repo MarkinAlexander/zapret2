@@ -3250,12 +3250,15 @@ fmark_err:
 	if (!lua_test_init_script_files())
 		exit_clean(1);
 
-	if (!LoadAllHostLists())
+	// --dry-run : do not load list contents. file access is already verified above.
+	// contents are not validated by dry-run, they are only loaded and discarded.
+	// large lists (100K+ hosts) can take seconds to hash on slow embedded CPUs.
+	if (!bDry && !LoadAllHostLists())
 	{
 		DLOG_ERR("hostlists load failed\n");
 		exit_clean(1);
 	}
-	if (!LoadAllIpsets())
+	if (!bDry && !LoadAllIpsets())
 	{
 		DLOG_ERR("ipset load failed\n");
 		exit_clean(1);
