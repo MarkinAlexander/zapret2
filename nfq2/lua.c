@@ -1095,6 +1095,18 @@ static int luacall_flow_strategy_assign(lua_State *L)
 		lua_pushnil(L);
 	return 1;
 }
+static int luacall_flow_strategy_canary_get(lua_State *L)
+{
+	lua_check_argc(L,"flow_strategy_canary_get",1);
+	t_lua_desync_context *ctx = lua_desync_ctx(L);
+	uint32_t strategy = 0;
+	if (ctx->ctrack && ctx->dp && ctx->ctrack->hostname &&
+		ConntrackAdaptiveLookupCanaryStrategy(ctx->dp->n, ctx->ctrack->hostname, &strategy))
+		lua_pushinteger(L, strategy);
+	else
+		lua_pushnil(L);
+	return 1;
+}
 
 static int luacall_execution_plan_cancel(lua_State *L)
 {
@@ -4581,6 +4593,7 @@ static void lua_init_functions(void)
 		{"execution_plan_cancel",luacall_execution_plan_cancel},
 		// C-owned immutable first strategy attribution for this conntrack flow
 		{"flow_strategy_assign",luacall_flow_strategy_assign},
+		{"flow_strategy_canary_get",luacall_flow_strategy_canary_get},
 		// get raw packet data
 		{"raw_packet",luacall_raw_packet},
 
