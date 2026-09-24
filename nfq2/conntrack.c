@@ -275,9 +275,11 @@ static t_conntrack_pool *ConntrackPoolSearch(t_conntrack_pool *p, const t_conn *
 static void ConntrackInitTrack(t_ctrack *t)
 {
 	memset(t, 0, sizeof(*t));
-	t->candidate_profile_id = params.adaptive_strategy_profile;
-	t->candidate_strategy_id = params.adaptive_strategy_id;
-	t->candidate_generation = adaptive_candidate_generation;
+	if (params.adaptive_strategy_profile && params.adaptive_strategy_id) {
+		t->candidate_profile_id = params.adaptive_strategy_profile;
+		t->candidate_strategy_id = params.adaptive_strategy_id;
+		t->candidate_generation = adaptive_candidate_generation;
+	}
 	t->l7proto = L7_UNKNOWN;
 	t->reasm_client_payload = L7P_UNKNOWN;
 	t->pos.client.scale = t->pos.server.scale = 0;
@@ -658,7 +660,7 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 	track->profile_id = profile_id;
 	track->strategy_id = strategy_id;
 	snprintf(track->adaptive_scope, sizeof(track->adaptive_scope), "%s", scope ? scope : "default");
-	track->strategy_generation = adaptive_strategy_seq++;
+	track->strategy_generation = pinned ? track->candidate_generation : adaptive_strategy_seq++;
 	track->strategy_assigned = true;
 	adaptive_emit(track, "STRATEGY_APPLIED", "");
 	if (selected_strategy) *selected_strategy = strategy_id;
