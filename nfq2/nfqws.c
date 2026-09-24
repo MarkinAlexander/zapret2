@@ -462,6 +462,8 @@ static int nfq_main(void)
 		DLOG_PERROR("create pidfile");
 		return 1;
 	}
+	/* Connect while privileged: the controller socket is deliberately private. */
+	ConntrackAdaptiveTelemetryInit();
 
 	if (params.droproot && !droproot(params.uid, params.user, params.gid, params.gid_count) || !dropcaps())
 		goto err;

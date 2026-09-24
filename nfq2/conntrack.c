@@ -25,7 +25,27 @@ static const char adaptive_trace_limit_marker[] = "# TRACE_LIMIT\tmax_bytes=4194
 #ifdef __linux__
 static int adaptive_event_socket = -1;
 static uint64_t adaptive_event_drops;
+#endif
+static int adaptive_event_file_fd = -1;
 
+void ConntrackAdaptiveTelemetryInit(void)
+{
+#ifdef __linux__
+	// unix transport sends per datagram to the consumer-owned socket, no
+	// preconnect : the consumer may (re)create its socket at any time and a
+	// fresh sendto picks the new inode automatically (B+ transport)
+	if (!strncmp(params.adaptive_events_file, "unix:", 5)) return;
+#endif
+	if (params.adaptive_events_file[0] && adaptive_event_file_fd < 0) {
+		adaptive_event_file_fd = open(params.adaptive_events_file, O_WRONLY|O_CREAT|O_APPEND, 0600);
+		if (adaptive_event_file_fd >= 0 && fchmod(adaptive_event_file_fd, 0600) != 0) {
+			close(adaptive_event_file_fd);
+			adaptive_event_file_fd = -1;
+		}
+	}
+}
+
+#ifdef __linux__
 static void adaptive_note_drop(void)
 {
 	if (adaptive_event_drops != UINT64_MAX) adaptive_event_drops++;
@@ -80,11 +100,8 @@ static void adaptive_write_line(const char *line, size_t n)
 #endif
 		return;
 	}
-	fd=open(params.adaptive_events_file, O_WRONLY|O_CREAT|O_APPEND, 0600);
-	if (fd<0) return;
-	(void)fchmod(fd, 0600);
-	if (adaptive_trace_limited || fstat(fd, &st)<0 || st.st_size<0) {
-		close(fd);
+	fd=adaptive_event_file_fd;
+	if (fd<0 || adaptive_trace_limited || fstat(fd, &st)<0 || st.st_size<0) {
 		return;
 	}
 	/* Reserve room for an explicit truncation marker; never grow /tmp without bound. */
@@ -95,14 +112,12 @@ static void adaptive_write_line(const char *line, size_t n)
 			if (written != (ssize_t)(sizeof(adaptive_trace_limit_marker)-1)) adaptive_trace_limited = true;
 		}
 		adaptive_trace_limited = true;
-		close(fd);
 		return;
 	}
 	{
 		ssize_t written = write(fd, line, n);
 		if (written != (ssize_t)n) adaptive_trace_limited = true;
 	}
-	close(fd);
 }
 
 static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
