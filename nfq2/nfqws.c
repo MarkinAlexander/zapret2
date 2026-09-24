@@ -4,6 +4,7 @@
 #include "sec.h"
 #include "desync.h"
 #include "helpers.h"
+#include "autoexclude.h"
 #include "checksum.h"
 #include "params.h"
 #include "protocol.h"
@@ -109,6 +110,7 @@ static void onusr2(int sig)
 	}
 	printf("\nIPCACHE\n");
 	ipcachePrint(&params.ipcache);
+	ae_dump();
 	printf("\n");
 }
 static void onint(int sig)
@@ -557,10 +559,31 @@ static int nfq_main(void)
 			{
 				bt_next = bt = 0;
 				if (bQuit) goto quit;
-				res = 1;
+				if (ae_wants_ticks())
+				{
+					// keep the autoexclude state machine running even without lua timers
+					tv.tv_sec = 1;
+					tv.tv_usec = 0;
+					FD_ZERO(&fdset);
+					FD_SET(fd, &fdset);
+					res = select(fd+1, &fdset, NULL, NULL, &tv);
+					if (bQuit) goto quit;
+					if (res == -1)
+					{
+						if (errno == EINTR) res = 0;
+						else
+						{
+							DLOG_PERROR("select");
+							goto err;
+						}
+					}
+				}
+				else
+					res = 1;
 			}
 			lua_do_gc();
 			ReloadCheck();
+			ae_timer();
 			if (res)
 			{
 				rd = recv(fd, buf, NFQ_MAX_RECV_SIZE, 0);
@@ -610,6 +633,7 @@ ex:
 	free(buf);
 	nfq_deinit(&h, &qh);
 	if (cbdata.sock>=0) close(cbdata.sock);
+	ae_shutdown();
 	lua_shutdown();
 #ifdef HAS_FILTER_SSID
 	wlan_info_deinit();
@@ -1912,6 +1936,33 @@ static void exithelp(void)
 		" --hostlist-auto-udp-out=<int>\t\t\t\t; udp failure condition : sent at least `udp_out` packets (default : %u)\n"
 		" --hostlist-auto-udp-in=<int>\t\t\t\t; udp failure condition : received not more than `udp_in` packets (default : %u)\n"
 		" --hostlist-auto-debug=<logfile>\t\t\t; debug auto hostlist positives (global parameter)\n"
+		"\nAUTOEXCLUDE (detect hosts broken by our own tampering, temporarily pass them) :\n"
+		" --autoexclude=[0|1]\t\t\t\t\t; master switch (default : 1)\n"
+		" --autoexclude-file=<filename>\t\t\t; persistence file, pass-only hosts, tmpfs default : %s\n"
+		" --autoexclude-state-file=<filename>\t\t; durable state sidecar, tmpfs default (/tmp)\n"
+		" --autoexclude-manual-file=<filename>\t\t; hosts here are never auto-managed (default : %s)\n"
+		" --autoexclude-log=<logfile>\t\t\t; event log\n"
+		" --autoexclude-curl=<binary>\t\t\t; probe binary (default : %s)\n"
+		" --autoexclude-fail-flows=<int>\t\t\t; failed flows to suspect a host (default : %d)\n"
+		" --autoexclude-fail-window=<int>\t\t\t; fails must be within these seconds (default : %d)\n"
+		" --autoexclude-fail-maxseq=<int>\t\t\t; incoming relseq ceiling for rst/garbage fail (default : %u)\n"
+		" --autoexclude-retrans-threshold=<int>\t\t; request retransmissions to fail a tampered flow (default : %d)\n"
+		" --autoexclude-fail-silence=<int>\t\t; no server packets for this many seconds fails a tampered flow (default : %d)\n"
+		" --autoexclude-udp-out=<int>\t\t\t; udp fail : sent at least this many (default : %d)\n"
+		" --autoexclude-udp-in=<int>\t\t\t; udp fail : received not more than this many (default : %d)\n"
+		" --autoexclude-probe-wait=<int>\t\t\t; passive wait before the active probe (default : %d)\n"
+		" --autoexclude-probe-window=<int>\t\t\t; max probe phase duration (default : %d)\n"
+		" --autoexclude-reattack-window=<int>\t\t; re-attack window between probes (default : %d)\n"
+		" --autoexclude-probe-maxtime=<int>\t\t; probe curl timeout (default : %d)\n"
+		" --autoexclude-ttl-first=<int>\t\t\t; first exclusion duration (default : %d)\n"
+		" --autoexclude-ttl=<int>\t\t\t\t; base exclusion duration (default : %d)\n"
+		" --autoexclude-ttl-max=<int>\t\t\t; max exclusion duration (default : %d)\n"
+		" --autoexclude-cooldown=<int>\t\t\t; NOT_CANDIDATE cooldown (default : %d)\n"
+		" --autoexclude-sticky-after=<int>\t\t; exclusions before permanent, 0 = never (default : %d)\n"
+		" --autoexclude-mirror-file=<filename>\t\t; flash mirror for reboot survival, empty prefix to disable (default : %s)\n"
+		" --autoexclude-mirror-interval=<int>\t\t; flash mirror cadence in seconds (default : %d)\n"
+		" --autoexclude-max-hosts=<int>\t\t\t; max tracked hosts (default : %d)\n"
+		" --autoexclude-mode=<hybrid|passive>\t\t; passive never sends probe traffic (default : hybrid)\n"
 		"\nLUA PACKET PASS MODE:\n"
 		" --payload=type[,type]\t\t\t\t\t; set payload types following LUA functions should process : %s\n"
 		" --out-range=[(n|a|d|s|p)<int>](-|<)[(n|a|d|s|p)<int>]\t; set outgoing packet range for following LUA functions. '-' - include end pos, '<' - not include. prefix meaning : n - packet number, d - data packet number, s - relative sequence, p - data position relative sequence, b - byte count, x - never, a - always\n"
@@ -1929,6 +1980,13 @@ static void exithelp(void)
 		HOSTLIST_AUTO_RETRANS_THRESHOLD_DEFAULT,
 		HOSTLIST_AUTO_RETRANS_MAXSEQ, HOSTLIST_AUTO_INCOMING_MAXSEQ,
 		HOSTLIST_AUTO_UDP_OUT, HOSTLIST_AUTO_UDP_IN,
+		AE_FILE_DEFAULT, AE_MANUAL_FILE_DEFAULT, AE_CURL_DEFAULT,
+		AE_FAIL_FLOWS_DEFAULT, AE_FAIL_WINDOW_DEFAULT, AE_FAIL_MAXSEQ_DEFAULT,
+		AE_RETRANS_THRESHOLD_DEFAULT, AE_FAIL_SILENCE_DEFAULT, AE_UDP_OUT_DEFAULT, AE_UDP_IN_DEFAULT,
+		AE_PROBE_WAIT_DEFAULT, AE_PROBE_WINDOW_DEFAULT, AE_REATTACK_WINDOW_DEFAULT,
+		AE_PROBE_MAXTIME_DEFAULT, AE_TTL_FIRST_DEFAULT, AE_TTL_DEFAULT,
+		AE_TTL_MAX_DEFAULT, AE_COOLDOWN_DEFAULT, AE_STICKY_AFTER_DEFAULT,
+		AE_MIRROR_FILE_DEFAULT, AE_MIRROR_INTERVAL_DEFAULT, AE_MAX_HOSTS_DEFAULT,
 		all_payloads
 	);
 	close_std_and_exit(1);
@@ -2031,6 +2089,32 @@ enum opt_indices {
 	IDX_HOSTLIST_AUTO_UDP_IN,
 	IDX_HOSTLIST_AUTO_UDP_OUT,
 	IDX_HOSTLIST_AUTO_DEBUG,
+	IDX_AUTOEXCLUDE,
+	IDX_AUTOEXCLUDE_FILE,
+	IDX_AUTOEXCLUDE_STATE_FILE,
+	IDX_AUTOEXCLUDE_MANUAL_FILE,
+	IDX_AUTOEXCLUDE_LOG,
+	IDX_AUTOEXCLUDE_CURL,
+	IDX_AUTOEXCLUDE_FAIL_FLOWS,
+	IDX_AUTOEXCLUDE_FAIL_WINDOW,
+	IDX_AUTOEXCLUDE_FAIL_MAXSEQ,
+	IDX_AUTOEXCLUDE_RETRANS_THRESHOLD,
+	IDX_AUTOEXCLUDE_FAIL_SILENCE,
+	IDX_AUTOEXCLUDE_UDP_OUT,
+	IDX_AUTOEXCLUDE_UDP_IN,
+	IDX_AUTOEXCLUDE_PROBE_WAIT,
+	IDX_AUTOEXCLUDE_PROBE_WINDOW,
+	IDX_AUTOEXCLUDE_REATTACK_WINDOW,
+	IDX_AUTOEXCLUDE_PROBE_MAXTIME,
+	IDX_AUTOEXCLUDE_TTL_FIRST,
+	IDX_AUTOEXCLUDE_TTL,
+	IDX_AUTOEXCLUDE_TTL_MAX,
+	IDX_AUTOEXCLUDE_COOLDOWN,
+	IDX_AUTOEXCLUDE_STICKY_AFTER,
+	IDX_AUTOEXCLUDE_MIRROR_FILE,
+	IDX_AUTOEXCLUDE_MIRROR_INTERVAL,
+	IDX_AUTOEXCLUDE_MAX_HOSTS,
+	IDX_AUTOEXCLUDE_MODE,
 	IDX_NEW,
 	IDX_SKIP,
 	IDX_NAME,
@@ -2139,6 +2223,32 @@ static const struct option long_options[] = {
 	[IDX_HOSTLIST_AUTO_UDP_IN] = {"hostlist-auto-udp-in", required_argument, 0, 0},
 	[IDX_HOSTLIST_AUTO_UDP_OUT] = {"hostlist-auto-udp-out", required_argument, 0, 0},
 	[IDX_HOSTLIST_AUTO_DEBUG] = {"hostlist-auto-debug", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE] = {"autoexclude", optional_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_FILE] = {"autoexclude-file", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_STATE_FILE] = {"autoexclude-state-file", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_MANUAL_FILE] = {"autoexclude-manual-file", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_LOG] = {"autoexclude-log", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_CURL] = {"autoexclude-curl", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_FAIL_FLOWS] = {"autoexclude-fail-flows", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_FAIL_WINDOW] = {"autoexclude-fail-window", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_FAIL_MAXSEQ] = {"autoexclude-fail-maxseq", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_RETRANS_THRESHOLD] = {"autoexclude-retrans-threshold", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_FAIL_SILENCE] = {"autoexclude-fail-silence", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_UDP_OUT] = {"autoexclude-udp-out", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_UDP_IN] = {"autoexclude-udp-in", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_PROBE_WAIT] = {"autoexclude-probe-wait", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_PROBE_WINDOW] = {"autoexclude-probe-window", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_REATTACK_WINDOW] = {"autoexclude-reattack-window", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_PROBE_MAXTIME] = {"autoexclude-probe-maxtime", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_TTL_FIRST] = {"autoexclude-ttl-first", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_TTL] = {"autoexclude-ttl", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_TTL_MAX] = {"autoexclude-ttl-max", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_COOLDOWN] = {"autoexclude-cooldown", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_STICKY_AFTER] = {"autoexclude-sticky-after", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_MIRROR_FILE] = {"autoexclude-mirror-file", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_MIRROR_INTERVAL] = {"autoexclude-mirror-interval", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_MAX_HOSTS] = {"autoexclude-max-hosts", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_MODE] = {"autoexclude-mode", required_argument, 0, 0},
 	[IDX_NEW] = {"new", optional_argument, 0, 0},
 	[IDX_SKIP] = {"skip", no_argument, 0, 0},
 	[IDX_NAME] = {"name", required_argument, 0, 0},
@@ -2721,6 +2831,214 @@ int main(int argc, char **argv)
 		}
 		break;
 
+		case IDX_AUTOEXCLUDE:
+			params.autoexclude = !optarg || !!atoi(optarg);
+			params.b_autoexclude_set = true;
+			break;
+		case IDX_AUTOEXCLUDE_FILE:
+			if (!realpath_any(optarg,params.autoexclude_file))
+			{
+				DLOG_ERR("bad file '%s'\n",optarg);
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_STATE_FILE:
+			if (!realpath_any(optarg,params.autoexclude_state_file))
+			{
+				DLOG_ERR("bad file '%s'\n",optarg);
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_MANUAL_FILE:
+			if (!realpath_any(optarg,params.autoexclude_manual_file))
+			{
+				DLOG_ERR("bad file '%s'\n",optarg);
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_LOG:
+			if (!realpath_any(optarg,params.autoexclude_log))
+			{
+				DLOG_ERR("bad file '%s'\n",optarg);
+				exit_clean(1);
+			}
+			else
+			{
+				FILE *F = fopen(params.autoexclude_log, "a+t");
+				if (!F)
+				{
+					DLOG_ERR("cannot create %s\n", optarg);
+					exit_clean(1);
+				}
+				fclose(F);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_CURL:
+			snprintf(params.autoexclude_curl, sizeof(params.autoexclude_curl), "%s", optarg);
+			break;
+		case IDX_AUTOEXCLUDE_FAIL_FLOWS:
+			params.autoexclude_fail_flows = atoi(optarg);
+			if (params.autoexclude_fail_flows < 2 || params.autoexclude_fail_flows > 20)
+			{
+				DLOG_ERR("autoexclude-fail-flows must be within 2..20\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_FAIL_WINDOW:
+			params.autoexclude_fail_window = atoi(optarg);
+			if (params.autoexclude_fail_window < 1)
+			{
+				DLOG_ERR("autoexclude-fail-window is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_FAIL_MAXSEQ:
+			params.autoexclude_fail_maxseq = atoi(optarg);
+			if (params.autoexclude_fail_maxseq < 1)
+			{
+				DLOG_ERR("autoexclude-fail-maxseq is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_RETRANS_THRESHOLD:
+			params.autoexclude_retrans_threshold = atoi(optarg);
+			if (params.autoexclude_retrans_threshold < 2 || params.autoexclude_retrans_threshold > 10)
+			{
+				DLOG_ERR("autoexclude-retrans-threshold must be within 2..10\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_FAIL_SILENCE:
+			params.autoexclude_fail_silence = atoi(optarg);
+			if (params.autoexclude_fail_silence < 3 || params.autoexclude_fail_silence > 120)
+			{
+				DLOG_ERR("autoexclude-fail-silence must be within 3..120\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_UDP_OUT:
+			params.autoexclude_udp_out = atoi(optarg);
+			if (params.autoexclude_udp_out < 1)
+			{
+				DLOG_ERR("autoexclude-udp-out is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_UDP_IN:
+			params.autoexclude_udp_in = atoi(optarg);
+			if (params.autoexclude_udp_in < 0)
+			{
+				DLOG_ERR("autoexclude-udp-in is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_PROBE_WAIT:
+			params.autoexclude_probe_wait = atoi(optarg);
+			if (params.autoexclude_probe_wait < 1)
+			{
+				DLOG_ERR("autoexclude-probe-wait is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_PROBE_WINDOW:
+			params.autoexclude_probe_window = atoi(optarg);
+			if (params.autoexclude_probe_window < 1)
+			{
+				DLOG_ERR("autoexclude-probe-window is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_REATTACK_WINDOW:
+			params.autoexclude_reattack_window = atoi(optarg);
+			if (params.autoexclude_reattack_window < 1)
+			{
+				DLOG_ERR("autoexclude-reattack-window is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_PROBE_MAXTIME:
+			params.autoexclude_probe_maxtime = atoi(optarg);
+			if (params.autoexclude_probe_maxtime < 1)
+			{
+				DLOG_ERR("autoexclude-probe-maxtime is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_TTL_FIRST:
+			params.autoexclude_ttl_first = atoi(optarg);
+			if (params.autoexclude_ttl_first < 1)
+			{
+				DLOG_ERR("autoexclude-ttl-first is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_TTL:
+			params.autoexclude_ttl = atoi(optarg);
+			if (params.autoexclude_ttl < 1)
+			{
+				DLOG_ERR("autoexclude-ttl is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_TTL_MAX:
+			params.autoexclude_ttl_max = atoi(optarg);
+			if (params.autoexclude_ttl_max < 1)
+			{
+				DLOG_ERR("autoexclude-ttl-max is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_COOLDOWN:
+			params.autoexclude_cooldown = atoi(optarg);
+			if (params.autoexclude_cooldown < 1)
+			{
+				DLOG_ERR("autoexclude-cooldown is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_STICKY_AFTER:
+			params.autoexclude_sticky_after = atoi(optarg);
+			if (params.autoexclude_sticky_after < 0 || params.autoexclude_sticky_after > 100)
+			{
+				DLOG_ERR("autoexclude-sticky-after must be within 0..100 (0 = never permanent)\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_MIRROR_FILE:
+			if (!realpath_any(optarg,params.autoexclude_mirror_file))
+			{
+				DLOG_ERR("bad file '%s'\n",optarg);
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_MIRROR_INTERVAL:
+			params.autoexclude_mirror_interval = atoi(optarg);
+			if (params.autoexclude_mirror_interval < 600)
+			{
+				DLOG_ERR("autoexclude-mirror-interval must be at least 600 s (flash friendliness)\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_MAX_HOSTS:
+			params.autoexclude_max_hosts = atoi(optarg);
+			if (params.autoexclude_max_hosts < 1)
+			{
+				DLOG_ERR("autoexclude-max-hosts is not valid\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_MODE:
+			if (!strcmp(optarg,"hybrid"))
+				params.autoexclude_passive = false;
+			else if (!strcmp(optarg,"passive"))
+				params.autoexclude_passive = true;
+			else
+			{
+				DLOG_ERR("autoexclude-mode must be hybrid or passive\n");
+				exit_clean(1);
+			}
+			break;
+
 		case IDX_NEW:
 			if (bSkip)
 			{
@@ -3249,6 +3567,9 @@ fmark_err:
 		exit_clean(1);
 	if (!lua_test_init_script_files())
 		exit_clean(1);
+	// autoexclude must prepare its files while still root (privdrop-safe access)
+	if (!ae_prepare())
+		exit_clean(1);
 
 	// --dry-run : do not load list contents. file access is already verified above.
 	// contents are not validated by dry-run, they are only loaded and discarded.
@@ -3370,6 +3691,8 @@ fmark_err:
 		DLOG_CONDUP("command line parameters verified\n");
 		exit_clean(0);
 	}
+
+	ae_init();
 
 	if (params.ctrack_disable)
 		DLOG_CONDUP("conntrack disabled ! some functions will not work. make sure it's what you want.\n");

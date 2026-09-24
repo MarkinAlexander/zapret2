@@ -35,6 +35,32 @@
 #define HOSTLIST_AUTO_UDP_OUT			4
 #define HOSTLIST_AUTO_UDP_IN			1
 
+// autoexclude defaults. feature is ON by default, disabled with --autoexclude=0.
+// files live in tmpfs by default : flash-friendly (cheap kinetics), the list
+// is rebuilt by detection after a reboot anyway
+#define AE_FILE_DEFAULT		"/tmp/nfqws2_netrogat-auto.txt"
+#define AE_MANUAL_FILE_DEFAULT	"/opt/zator/lists/netrogat.txt"
+#define AE_CURL_DEFAULT		"/opt/bin/curl"
+#define AE_FAIL_FLOWS_DEFAULT		3
+#define AE_FAIL_WINDOW_DEFAULT		120
+#define AE_FAIL_MAXSEQ_DEFAULT		4096
+#define AE_RETRANS_THRESHOLD_DEFAULT	3
+#define AE_FAIL_SILENCE_DEFAULT		6
+#define AE_UDP_OUT_DEFAULT		4
+#define AE_UDP_IN_DEFAULT		1
+#define AE_PROBE_WAIT_DEFAULT		15
+#define AE_PROBE_WINDOW_DEFAULT		60
+#define AE_REATTACK_WINDOW_DEFAULT	20
+#define AE_PROBE_MAXTIME_DEFAULT		10
+#define AE_TTL_FIRST_DEFAULT		900
+#define AE_TTL_DEFAULT			3600
+#define AE_TTL_MAX_DEFAULT		86400
+#define AE_COOLDOWN_DEFAULT		1800
+#define AE_MAX_HOSTS_DEFAULT		256
+#define AE_STICKY_AFTER_DEFAULT		3	// exclusions before an exclusion becomes permanent
+#define AE_MIRROR_FILE_DEFAULT		"/opt/zator/lists/netrogat-auto.txt"
+#define AE_MIRROR_INTERVAL_DEFAULT	21600	// flash mirror cadence, seconds
+
 #define IPCACHE_LIFETIME		7200
 
 #define MAX_GIDS 64
@@ -170,6 +196,25 @@ struct params_s
 	char pidfile[PATH_MAX];
 
 	char hostlist_auto_debuglog[PATH_MAX];
+
+	// autoexclude : detect hosts broken by our own tampering, temporarily pass them
+	bool autoexclude;
+	bool b_autoexclude_set;		// --autoexclude was explicitly given
+	char autoexclude_file[PATH_MAX];
+	char autoexclude_state_file[PATH_MAX];
+	char autoexclude_manual_file[PATH_MAX];
+	char autoexclude_log[PATH_MAX];
+	char autoexclude_curl[PATH_MAX];
+	int autoexclude_fail_flows, autoexclude_fail_window, autoexclude_fail_maxseq;
+	int autoexclude_retrans_threshold, autoexclude_fail_silence;
+	int autoexclude_udp_out, autoexclude_udp_in;
+	int autoexclude_probe_wait, autoexclude_probe_window, autoexclude_reattack_window, autoexclude_probe_maxtime;
+	int autoexclude_ttl_first, autoexclude_ttl, autoexclude_ttl_max, autoexclude_cooldown, autoexclude_max_hosts;
+	int autoexclude_sticky_after;	// exclusions before permanent (0 = never)
+	char autoexclude_mirror_file[PATH_MAX]; // flash mirror, empty = disabled
+	int autoexclude_mirror_interval;
+	bool autoexclude_passive;	// no active probing, passive differential only
+	bool ae_inited;		// runtime : ae_init succeeded
 
 	// hostlist files with data for all profiles
 	struct hostlist_files_head hostlists;

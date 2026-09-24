@@ -67,6 +67,11 @@ typedef struct
 	uint8_t req_retrans_counter;		// number of request retransmissions
 	bool failure_detect_finalized;
 
+	// autoexclude state of this flow
+	bool ae_attacked;			// tampering was applied to this flow
+	bool ae_finalized;			// fail/success verdict already accounted
+	uint8_t ae_retrans;			// retransmissions of the tampered request
+
 	uint8_t incoming_ttl;
 
 	bool b_cutoff;				// mark for deletion

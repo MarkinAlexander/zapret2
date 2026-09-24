@@ -1783,6 +1783,8 @@ bool ensure_file_access(const char *filename)
 
 static int rawsend_sock4=-1, rawsend_sock6=-1;
 static bool b_bind_fix4=false, b_bind_fix6=false;
+// autoexclude : incremented on every successful rawsend
+uint64_t g_rawsend_seq = 0;
 static void rawsend_clean_sock(int *sock)
 {
 	if (sock && *sock!=-1)
@@ -2037,6 +2039,7 @@ nofix:
 		DLOG_PERROR(s);
 		return false;
 	}
+	g_rawsend_seq++; // autoexclude : any raw packet means tampering
 	return true;
 #endif
 }

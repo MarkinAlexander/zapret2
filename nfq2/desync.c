@@ -10,6 +10,7 @@
 #include "hostlist.h"
 #include "ipset.h"
 #include "conntrack.h"
+#include "autoexclude.h"
 #include "lua.h"
 
 #define PKTDATA_MAXDUMP 32
@@ -982,6 +983,7 @@ static uint8_t desync(
 	size_t l;
 	char instance[256];
 	const t_ctrack_position *pos, *rpos;
+	uint64_t rawsend_seq0 = g_rawsend_seq;
 
 	if (ctrack)
 	{
@@ -1208,6 +1210,9 @@ static uint8_t desync(
 		DLOG("no lua functions in this profile\n");
 ex:
 	luaL_unref(params.L, LUA_REGISTRYINDEX, ref_arg);
+	// autoexclude : the flow was tampered if lua changed the verdict or any raw packet was sent
+	if (ctrack && (((verdict & VERDICT_MASK) != VERDICT_PASS || g_rawsend_seq != rawsend_seq0)))
+		ae_hook_attacked(ctrack);
 	LUA_STACK_GUARD_LEAVE(params.L, 0)
 	return verdict;
 err:
@@ -1367,6 +1372,10 @@ static bool play_prolog(
 		if (ps->ssid) DLOG("found ssid for %s : %s\n", ifname, ps->ssid);
 #endif
 		if (ps->ctrack) ps->l7proto = ps->ctrack->l7proto;
+		// autoexclude : observe server->client packets for fail/success evidence.
+		// runs before profile matching to also cover pass-only (excluded) hosts
+		if (params.ae_inited && ps->ctrack && ps->bReverseFixed)
+			ae_hook_incoming(ps->ctrack, dis, ps->sdip4, ps->sdip6);
 		if (ps->dp)
 			DLOG("using cached desync profile %u (%s)\n", ps->dp->n, PROFILE_NAME(ps->dp));
 		else if (!ps->ctrack || !ps->ctrack->dp_search_complete)
@@ -1465,6 +1474,26 @@ static bool dp_rediscovery(struct play_state *ps)
 	}
 	else
 		bCheckDone = bCheckResult = bCheckExcluded = false;
+
+	// autoexclude : a host under differential probe or exclusion must not be tampered.
+	// takes the same path as a negative hostlist check : packets are passed as is,
+	// the matched profile (usually no_action) stays cached for the flow
+	{
+		const char *ae_hostname = ps->ctrack_replay ? ps->ctrack_replay->hostname : (ps->bHaveHost ? ps->host : NULL);
+		if (params.ae_inited && ae_hostname && ae_is_pass_only(ae_hostname))
+		{
+			ae_ip_remember(ps->sdip4, ps->sdip6, ae_hostname);
+			ae_passonly_attempt(ps->ctrack_replay);
+			if (ps->ctrack_replay)
+			{
+				ps->ctrack_replay->bCheckDone = true;
+				ps->ctrack_replay->bCheckResult = false;
+				ps->ctrack_replay->bCheckExcluded = true;
+			}
+			DLOG("autoexclude : not applying tampering to pass-only host %s\n", ae_hostname);
+			return false;
+		}
+	}
 	if (bDiscoveredL7 || bDiscoveredHostname)
 	{
 		struct desync_profile *dp_prev = ps->dp;
@@ -1519,7 +1548,10 @@ static bool dp_rediscovery(struct play_state *ps)
 	}
 
 	if (ps->ctrack_replay && ps->dis->proto==IPPROTO_UDP)
+	{
 		process_udp_fail(ps->ctrack_replay, ps->tpos, (struct sockaddr*)&ps->src);
+		ae_hook_udp(ps->ctrack_replay, ps->tpos);
+	}
 
 	if (bCheckDone && !bCheckResult)
 	{
@@ -1636,6 +1668,34 @@ static uint8_t dpi_desync_tcp_packet_play(
 			rdata_payload = ps.ctrack_replay->reasm_client.packet;
 			rlen_payload = ps.ctrack_replay->reasm_client.size_present;
 		}
+		else if (params.ae_inited && ps.ctrack &&
+			((ps.ctrack->hostname && ae_is_pass_only(ps.ctrack->hostname)) || ae_ip_pass_only(ps.sdip4, ps.sdip6)))
+		{
+			// autoexclude : pass-only host. do not engage the reassemble/delay
+			// machinery : delayed rawsend replay of original fragments breaks
+			// local and hw-fastpath connections (pre-existing reasm landmine).
+			// fragments are passed one by one, tampering is blocked in dp_rediscovery
+			if (!ps.ctrack->hostname && !ps.ctrack->hostname_discovered)
+			{
+				// the skip prevents the reassemble that would discover the
+				// hostname. backfill it from the ip binding so that probe
+				// observation (attempts, success, rst) keeps working
+				char aehost[256];
+				if (ae_ip_get_hostname(ps.sdip4, ps.sdip6, aehost, sizeof(aehost)))
+				{
+					char *s = strdup(aehost);
+					if (s)
+					{
+						free(ps.ctrack->hostname);
+						ps.ctrack->hostname = s;
+						ps.ctrack->hostname_discovered = true;
+					}
+				}
+			}
+			ae_passonly_attempt(ps.ctrack);
+			DLOG("autoexclude : passing fragment of pass-only host without reassembly\n");
+			return ps.verdict;
+		}
 		else if (reasm_client_feed(ps.ctrack, IPPROTO_TCP, dis->data_payload, dis->len_payload))
 		{
 			rdata_payload = ps.ctrack->reasm_client.packet;
@@ -1643,6 +1703,7 @@ static uint8_t dpi_desync_tcp_packet_play(
 		}
 
 		process_retrans_fail(ps.ctrack, dis, (struct sockaddr*)&ps.src, ifin);
+		ae_hook_retrans(ps.ctrack, dis);
 
 		// do not detect payload if reasm is in progress
 		if (!ps.ctrack_replay || ReasmIsEmpty(&ps.ctrack_replay->reasm_client))
@@ -1716,6 +1777,8 @@ static uint8_t dpi_desync_tcp_packet_play(
 					if (rp)
 					{
 						DLOG("DELAY desync until reasm is complete (#%u)\n", rawpacket_queue_count(&ps.ctrack->delayed));
+						// the delayed replay is tampering
+						ae_hook_attacked(ps.ctrack);
 					}
 					else
 					{
@@ -1750,6 +1813,7 @@ static uint8_t dpi_desync_tcp_packet_play(
 						if (make_tcp_ack_only(dis, mod_pkt, len_mod_pkt))
 						{
 							DLOG("replacing first reasm fragment with ACK-only packet (hardware fastpath workaround)\n");
+							ae_hook_attacked(ps.ctrack);
 							return VERDICT_MODIFY | VERDICT_NOCSUM;
 						}
 						DLOG_ERR("failed to build ACK-only reasm placeholder. dropping\n");

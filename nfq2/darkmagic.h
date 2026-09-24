@@ -145,6 +145,8 @@ bool rawsend_preinit(bool bind_fix4, bool bind_fix6);
 
 // auto creates internal socket and uses it for subsequent calls
 bool rawsend(const struct sockaddr* dst,uint32_t fwmark,const char *ifout,const void *data,size_t len);
+// autoexclude : incremented on every successful rawsend. used to attribute tampering to a flow
+extern uint64_t g_rawsend_seq;
 bool rawsend_rp(const struct rawpacket *rp);
 // return trues if all packets were send successfully
 bool rawsend_queue(struct rawpacket_queue *q);

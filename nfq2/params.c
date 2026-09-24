@@ -590,6 +590,34 @@ void init_params(struct params_s *params)
 	params->ipcache_lifetime = IPCACHE_LIFETIME;
 	params->lua_gc = LUA_GC_INTERVAL*1000;
 
+	// autoexclude is on by default. it self-disables when its file is not writable
+	params->autoexclude = true;
+	snprintf(params->autoexclude_file, sizeof(params->autoexclude_file), "%s", AE_FILE_DEFAULT);
+	snprintf(params->autoexclude_manual_file, sizeof(params->autoexclude_manual_file), "%s", AE_MANUAL_FILE_DEFAULT);
+	snprintf(params->autoexclude_curl, sizeof(params->autoexclude_curl), "%s", AE_CURL_DEFAULT);
+	// event log is on by default : /tmp is writable by the daemon user and
+	// survives nothing (tmpfs), which is fine for an observability log
+	snprintf(params->autoexclude_log, sizeof(params->autoexclude_log), "/tmp/nfqws2_autoexclude.log");
+	params->autoexclude_fail_flows = AE_FAIL_FLOWS_DEFAULT;
+	params->autoexclude_fail_window = AE_FAIL_WINDOW_DEFAULT;
+	params->autoexclude_fail_maxseq = AE_FAIL_MAXSEQ_DEFAULT;
+	params->autoexclude_retrans_threshold = AE_RETRANS_THRESHOLD_DEFAULT;
+	params->autoexclude_fail_silence = AE_FAIL_SILENCE_DEFAULT;
+	params->autoexclude_udp_out = AE_UDP_OUT_DEFAULT;
+	params->autoexclude_udp_in = AE_UDP_IN_DEFAULT;
+	params->autoexclude_probe_wait = AE_PROBE_WAIT_DEFAULT;
+	params->autoexclude_probe_window = AE_PROBE_WINDOW_DEFAULT;
+	params->autoexclude_reattack_window = AE_REATTACK_WINDOW_DEFAULT;
+	params->autoexclude_probe_maxtime = AE_PROBE_MAXTIME_DEFAULT;
+	params->autoexclude_ttl_first = AE_TTL_FIRST_DEFAULT;
+	params->autoexclude_ttl = AE_TTL_DEFAULT;
+	params->autoexclude_ttl_max = AE_TTL_MAX_DEFAULT;
+	params->autoexclude_cooldown = AE_COOLDOWN_DEFAULT;
+	params->autoexclude_max_hosts = AE_MAX_HOSTS_DEFAULT;
+	params->autoexclude_sticky_after = AE_STICKY_AFTER_DEFAULT;
+	snprintf(params->autoexclude_mirror_file, sizeof(params->autoexclude_mirror_file), "%s", AE_MIRROR_FILE_DEFAULT);
+	params->autoexclude_mirror_interval = AE_MIRROR_INTERVAL_DEFAULT;
+
 	LIST_INIT(&params->hostlists);
 	LIST_INIT(&params->ipsets);
 	LIST_INIT(&params->blobs);
