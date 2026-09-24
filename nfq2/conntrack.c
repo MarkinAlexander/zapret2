@@ -19,6 +19,7 @@
 static void taddr2str(uint8_t l3proto, const t_addr *a, char *buf, size_t bufsize);
 static uint64_t adaptive_flow_seq = 1;
 static uint64_t adaptive_strategy_seq = 1;
+static uint64_t adaptive_candidate_generation = 1;
 #define ADAPTIVE_EVENTS_MAX_BYTES (4U * 1024U * 1024U)
 static bool adaptive_trace_limited;
 static const char adaptive_trace_limit_marker[] = "# TRACE_LIMIT\tmax_bytes=4194304\n";
@@ -274,6 +275,9 @@ static t_conntrack_pool *ConntrackPoolSearch(t_conntrack_pool *p, const t_conn *
 static void ConntrackInitTrack(t_ctrack *t)
 {
 	memset(t, 0, sizeof(*t));
+	t->candidate_profile_id = params.adaptive_strategy_profile;
+	t->candidate_strategy_id = params.adaptive_strategy_id;
+	t->candidate_generation = adaptive_candidate_generation;
 	t->l7proto = L7_UNKNOWN;
 	t->reasm_client_payload = L7P_UNKNOWN;
 	t->pos.client.scale = t->pos.server.scale = 0;
@@ -640,7 +644,7 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 {
 	bool pinned;
 	if (!track || !track->flow_id || !profile_id || !strategy_id) return false;
-	pinned = params.adaptive_strategy_profile == profile_id && params.adaptive_strategy_id;
+	pinned = track->candidate_profile_id == profile_id && track->candidate_strategy_id;
 	if (track->strategy_assigned) {
 		if ((track->profile_id != profile_id || (!pinned && track->strategy_id != strategy_id) ||
 			strcmp(track->adaptive_scope, scope ? scope : "default")) && !track->strategy_conflict) {
@@ -650,7 +654,7 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 		if (selected_strategy) *selected_strategy = track->strategy_id;
 		return track->profile_id == profile_id && (pinned || track->strategy_id == strategy_id);
 	}
-	if (pinned) strategy_id = params.adaptive_strategy_id;
+	if (pinned) strategy_id = track->candidate_strategy_id;
 	track->profile_id = profile_id;
 	track->strategy_id = strategy_id;
 	snprintf(track->adaptive_scope, sizeof(track->adaptive_scope), "%s", scope ? scope : "default");
@@ -659,4 +663,16 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 	adaptive_emit(track, "STRATEGY_APPLIED", "");
 	if (selected_strategy) *selected_strategy = strategy_id;
 	return true;
+}
+
+void ConntrackAdaptiveSetCandidate(uint32_t profile_id, uint32_t strategy_id)
+{
+	params.adaptive_strategy_profile = profile_id;
+	params.adaptive_strategy_id = strategy_id;
+	if (adaptive_candidate_generation != UINT64_MAX) adaptive_candidate_generation++;
+}
+
+uint64_t ConntrackAdaptiveCandidateGeneration(void)
+{
+	return adaptive_candidate_generation;
 }

@@ -58,8 +58,9 @@ typedef struct
 
 	struct timespec t_start;
 	/* Z2R C-owned flow identity and assignment snapshot. */
-	uint64_t flow_id, strategy_generation;
+	uint64_t flow_id, strategy_generation, candidate_generation;
 	uint32_t profile_id, strategy_id;
+	uint32_t candidate_profile_id, candidate_strategy_id;
 	char adaptive_scope[64];
 	bool strategy_assigned, strategy_conflict;
 	bool client_rst, server_rst, client_fin, server_fin;
@@ -129,6 +130,8 @@ void ConntrackClearHostname(t_ctrack *track);
 void ConntrackAdaptiveTelemetryInit(void);
 bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strategy_id,
 	const char *scope, uint32_t *selected_strategy);
+void ConntrackAdaptiveSetCandidate(uint32_t profile_id, uint32_t strategy_id);
+uint64_t ConntrackAdaptiveCandidateGeneration(void);
 // host-scoped telemetry event on the adaptive bus (autoexclude engine)
 void adaptive_emit_host(const char *event, const char *host, const char *payload, uint32_t profile_id, uint32_t strategy_id);
 

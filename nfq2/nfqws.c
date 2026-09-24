@@ -442,6 +442,128 @@ static void notify_ready(void)
 #endif
 }
 
+#ifdef __linux__
+#define ADAPTIVE_CONTROL_MAX 256
+static int adaptive_control_open(void)
+{
+	struct sockaddr_un addr;
+	int fd, flags;
+	mode_t old_umask;
+	struct stat st;
+	const char *path = params.adaptive_control_socket;
+	if (!*path) return -1;
+	if (lstat(path, &st) == 0) {
+		DLOG_ERR("adaptive control socket path already exists: %s\n", path);
+		return -1;
+	}
+	if (errno != ENOENT) {
+		DLOG_PERROR("adaptive control socket lstat");
+		return -1;
+	}
+	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (fd < 0) { DLOG_PERROR("adaptive control socket"); return -1; }
+	flags = fcntl(fd, F_GETFL, 0);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) goto fail;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path) >= (int)sizeof(addr.sun_path)) {
+	errno = ENAMETOOLONG;
+		goto fail;
+	}
+	old_umask = umask(0177);
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		int saved_errno = errno;
+		umask(old_umask);
+		errno = saved_errno;
+		goto fail;
+	}
+	umask(old_umask);
+	if (chmod(path, 0600) < 0) {
+		int saved_errno = errno;
+		close(fd);
+		unlink(path);
+		errno = saved_errno;
+		DLOG_PERROR("adaptive control socket chmod");
+		return -1;
+	}
+	return fd;
+fail:
+	DLOG_PERROR("adaptive control socket setup");
+	close(fd);
+	return -1;
+}
+
+static bool adaptive_profile_exists(uint32_t profile_id)
+{
+	struct desync_profile_list *dpl;
+	LIST_FOREACH(dpl, &params.desync_profiles, next)
+		if (dpl->dp.n == profile_id) return true;
+	return false;
+}
+
+static bool adaptive_parse_uint32(const char **cursor, char delimiter, uint32_t *value)
+{
+	const char *p = *cursor;
+	uint32_t v = 0;
+	if (!*p || *p < '0' || *p > '9') return false;
+	while (*p >= '0' && *p <= '9') {
+		unsigned digit = (unsigned)(*p - '0');
+		if (v > (UINT32_MAX - digit) / 10) return false;
+		v = v * 10 + digit;
+		p++;
+	}
+	if (*p != delimiter) return false;
+	*value = v;
+	*cursor = p + 1;
+	return true;
+}
+
+static void adaptive_control_handle(int fd)
+{
+	char request[ADAPTIVE_CONTROL_MAX], reply[192];
+	struct sockaddr_un peer;
+	const char *cursor;
+	socklen_t peer_len = sizeof(peer);
+	ssize_t n;
+	uint32_t profile = 0, strategy = 0;
+	int nr;
+	const char *status = "invalid_request";
+	bool peer_can_reply = false;
+	memset(&peer, 0, sizeof(peer));
+	n = recvfrom(fd, request, sizeof(request), MSG_TRUNC,
+		(struct sockaddr *)&peer, &peer_len);
+	if (n < 0) {
+		if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) DLOG_PERROR("adaptive control recvfrom");
+		return;
+	}
+	if (peer_len > offsetof(struct sockaddr_un, sun_path) &&
+		peer.sun_family == AF_UNIX && peer.sun_path[0]) peer_can_reply = true;
+	if (peer_can_reply && (size_t)n < sizeof(request) && n > 0) {
+		request[n] = 0;
+		cursor = request;
+		if (!strncmp(cursor, "SET_CANDIDATE\t1\t", sizeof("SET_CANDIDATE\t1\t") - 1)) {
+			cursor += sizeof("SET_CANDIDATE\t1\t") - 1;
+			if (adaptive_parse_uint32(&cursor, '\t', &profile) &&
+				adaptive_parse_uint32(&cursor, '\n', &strategy) && cursor == request + n &&
+				profile && strategy && profile == params.adaptive_strategy_profile &&
+				adaptive_profile_exists(profile)) {
+				ConntrackAdaptiveSetCandidate(profile, strategy);
+				status = "ok";
+			}
+		}
+	}
+	if (!strcmp(status, "ok"))
+		nr = snprintf(reply, sizeof(reply), "ACK\t1\tOK\t%u\t%u\t%llu\n", profile, strategy,
+			(unsigned long long)ConntrackAdaptiveCandidateGeneration());
+	else
+		nr = snprintf(reply, sizeof(reply), "ACK\t1\tERR\t%s\n", status);
+	if (peer_can_reply && nr > 0 && (size_t)nr < sizeof(reply))
+		if (sendto(fd, reply, (size_t)nr, MSG_DONTWAIT,
+			(struct sockaddr *)&peer, peer_len) < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+			DLOG_PERROR("adaptive control sendto");
+}
+#endif
+
 // extra space for netlink headers
 #define NFQ_MAX_RECV_SIZE (RECONSTRUCT_MAX_SIZE+4096)
 static int nfq_main(void)
@@ -449,6 +571,7 @@ static int nfq_main(void)
 	struct nfq_handle *h = NULL;
 	struct nfq_q_handle *qh = NULL;
 	int res, fd, e;
+	int control_fd = -1;
 	ssize_t rd;
 	FILE *Fpid = NULL;
 	uint8_t *buf=NULL, *mod=NULL;
@@ -464,6 +587,8 @@ static int nfq_main(void)
 	}
 	/* Connect while privileged: the controller socket is deliberately private. */
 	ConntrackAdaptiveTelemetryInit();
+	control_fd = adaptive_control_open();
+	if (*params.adaptive_control_socket && control_fd < 0) goto err;
 
 	if (params.droproot && !droproot(params.uid, params.user, params.gid, params.gid_count) || !dropcaps())
 		goto err;
@@ -539,17 +664,21 @@ static int nfq_main(void)
 		if (bQuit) goto quit;
 		for(;;)
 		{
-			if (params.timers)
+			if (params.timers || control_fd >= 0)
 			{
-				if (!bt_next) bt_next = TimerPoolNext(params.timers, &params.timers_dirty);
-				bt = boottime_ms();
-				dbt = bt_next>bt ? bt_next-bt : 0;
-				tv.tv_sec = (time_t)(dbt/1000);
-				tv.tv_usec = (suseconds_t)(dbt%1000*1000);
+				if (params.timers) {
+					if (!bt_next) bt_next = TimerPoolNext(params.timers, &params.timers_dirty);
+					bt = boottime_ms();
+					dbt = bt_next>bt ? bt_next-bt : 0;
+					tv.tv_sec = (time_t)(dbt/1000);
+					tv.tv_usec = (suseconds_t)(dbt%1000*1000);
+				}
 
 				FD_ZERO(&fdset);
 				FD_SET(fd, &fdset);
-				res = select(fd+1, &fdset, NULL, NULL, &tv);
+				if (control_fd >= 0) FD_SET(control_fd, &fdset);
+				res = select((fd > control_fd ? fd : control_fd)+1, &fdset, NULL, NULL,
+					params.timers ? &tv : NULL);
 				if (bQuit) goto quit;
 				if (res == -1)
 				{
@@ -587,7 +716,9 @@ static int nfq_main(void)
 			lua_do_gc();
 			ReloadCheck();
 			ae_timer();
-			if (res)
+			if (control_fd >= 0 && res > 0 && FD_ISSET(control_fd, &fdset))
+				adaptive_control_handle(control_fd);
+			if (res && (control_fd < 0 || FD_ISSET(fd, &fdset)))
 			{
 				rd = recv(fd, buf, NFQ_MAX_RECV_SIZE, 0);
 				if (rd<0) break;
@@ -637,6 +768,10 @@ ex:
 	nfq_deinit(&h, &qh);
 	if (cbdata.sock>=0) close(cbdata.sock);
 	ae_shutdown();
+	if (control_fd >= 0) {
+		close(control_fd);
+		unlink(params.adaptive_control_socket);
+	}
 	lua_shutdown();
 #ifdef HAS_FILTER_SSID
 	wlan_info_deinit();
@@ -1866,6 +2001,9 @@ static void exithelp(void)
 		" --ctrack-disable=[0|1]\t\t\t\t\t; 1 or no argument disables conntrack\n"
 		" --adaptive-events=<file|unix:path>\t\t; append TSV or send nonblocking Unix datagrams (optional)\n"
 		" --adaptive-strategy=<profile>:<strategy>\t; pin only that profile to one controller-selected learning strategy\n"
+#ifdef __linux__
+		" --adaptive-control=<unix_path>\t\t; private Unix datagram SET_CANDIDATE v1 endpoint (optional)\n"
+#endif
 		" --payload-disable=[type[,type]]\t\t\t; do not discover these payload types. for available payload types see '--payload'. disable all if no argument.\n"
 		" --server=[0|1]\t\t\t\t\t\t; change multiple aspects of src/dst ip/port handling for incoming connections\n"
 		" --ipcache-lifetime=<int>\t\t\t\t; time in seconds to keep cached hop count and domain name (default %u). 0 = no expiration\n"
@@ -2065,6 +2203,9 @@ enum opt_indices {
 	IDX_CTRACK_DISABLE,
 	IDX_ADAPTIVE_EVENTS,
 	IDX_ADAPTIVE_STRATEGY,
+#ifdef __linux__
+	IDX_ADAPTIVE_CONTROL,
+#endif
 	IDX_PAYLOAD_DISABLE,
 	IDX_SERVER,
 	IDX_IPCACHE_LIFETIME,
@@ -2204,6 +2345,9 @@ static const struct option long_options[] = {
 	[IDX_CTRACK_DISABLE] = {"ctrack-disable", optional_argument, 0, 0},
 	[IDX_ADAPTIVE_EVENTS] = {"adaptive-events", required_argument, 0, 0},
 	[IDX_ADAPTIVE_STRATEGY] = {"adaptive-strategy", required_argument, 0, 0},
+#ifdef __linux__
+	[IDX_ADAPTIVE_CONTROL] = {"adaptive-control", required_argument, 0, 0},
+#endif
 	[IDX_PAYLOAD_DISABLE] = {"payload-disable", optional_argument, 0, 0},
 	[IDX_SERVER] = {"server", optional_argument, 0, 0},
 	[IDX_IPCACHE_LIFETIME] = {"ipcache-lifetime", required_argument, 0, 0},
@@ -2641,6 +2785,16 @@ int main(int argc, char **argv)
 			params.adaptive_strategy_id = (uint32_t)strategy;
 			break;
 		}
+#ifdef __linux__
+		case IDX_ADAPTIVE_CONTROL:
+			if (!optarg || optarg[0] != '/' || strlen(optarg) >= sizeof(params.adaptive_control_socket) ||
+				strlen(optarg) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+				DLOG_ERR("--adaptive-control requires an absolute Unix socket path\n");
+				exit_clean(1);
+			}
+			strcpy(params.adaptive_control_socket, optarg);
+			break;
+#endif
 		case IDX_SERVER:
 			params.server = !optarg || atoi(optarg);
 			break;
