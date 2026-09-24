@@ -493,6 +493,78 @@ jobs:
           if-no-files-found: error
 
 
+  package-adaptive-artifacts:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [ build-linux ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      repo_dir: zapret2-v1.0.5.2-adaptive.${{ github.run_number }}
+    steps:
+      - name: Checkout patched source
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.repo_dir }}
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ env.repo_dir }}/binaries
+          pattern: zapret2-linux-*
+
+      - name: Assemble standard and OpenWrt archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ env.repo_dir }}/binaries"
+          for dir in zapret2-linux-*; do
+            [ -d "$dir" ] || continue
+            archive=("$dir"/*.tar.xz)
+            [ -f "${archive[0]}" ] || { echo "missing Linux binary archive in $dir" >&2; exit 1; }
+            tar -C "$dir" -xJf "${archive[0]}"
+            rm -f "${archive[0]}"
+            case "$dir" in
+              zapret2-linux-arm) target=linux-arm ;;
+              zapret2-linux-arm64) target=linux-arm64 ;;
+              zapret2-linux-mips64) target=linux-mips64 ;;
+              zapret2-linux-mipselsf) target=linux-mipsel ;;
+              zapret2-linux-mipssf) target=linux-mips ;;
+              zapret2-linux-ppc) target=linux-ppc ;;
+              zapret2-linux-x86) target=linux-x86 ;;
+              zapret2-linux-x86_64) target=linux-x86_64 ;;
+              zapret2-linux-riscv64) target=linux-riscv64 ;;
+              zapret2-linux-lexra) target=linux-lexra ;;
+              *) echo "unexpected Linux artifact: $dir" >&2; exit 1 ;;
+            esac
+            mv "$dir" "$target"
+          done
+          for target in linux-arm linux-arm64 linux-mips64 linux-mipsel linux-mips \
+            linux-ppc linux-x86 linux-x86_64 linux-riscv64 linux-lexra; do
+            [ -d "$target" ] || { echo "missing mapped binaries/$target" >&2; exit 1; }
+            [ -x "$target/nfqws2" ] || { echo "missing binaries/$target/nfqws2" >&2; exit 1; }
+          done
+          cd ../..
+          root="${{ env.repo_dir }}"
+          tar --owner=0 --group=0 -c "$root" | pigz -11 >"$root.tar.gz"
+          (
+            cd "$root"
+            rm -rf binaries/{android*,freebsd*,win*} \
+              init.d/{openrc,pfsense,runit,s6,systemd,windivert.filter.examples} \
+              nfq2 ip2net mdig docs Makefile
+            pigz -11 lua/*.lua
+          )
+          tar --owner=0 --group=0 -c "$root" | pigz -11 >"$root-openwrt-embedded.tar.gz"
+
+      - name: Upload installable archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: zapret2-adaptive-${{ github.run_number }}
+          path: |
+            ${{ env.repo_dir }}.tar.gz
+            ${{ env.repo_dir }}-openwrt-embedded.tar.gz
+          if-no-files-found: error
+
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [ build-linux, build-windows, build-freebsd, build-android ]
@@ -602,13 +674,17 @@ jobs:
           tar --owner=0 --group=0 -c ${{ env.repo_dir }} | pigz -11 >${{ env.repo_dir }}-openwrt-embedded.tar.gz
 
       - name: Upload release assets
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: true
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-adaptive-beta.') }}
           draft: false
+          name: ${{ contains(github.ref_name, '-adaptive-beta.') && format('Adaptive Beta {0}', github.ref_name) || github.ref_name }}
           body: |
             ### zapret2 ${{ github.ref_name }}
+
+            ${{ contains(github.ref_name, '-adaptive-beta.') && 'Adaptive Strategy Selection beta: opt-in C flow telemetry, immutable per-flow strategy attribution, and acknowledged candidate control for controlled router testing. Learning remains disabled by default.' || 'zapret2 release build.' }}
           files: |
             zapret2*.tar.gz
             zapret2*.zip
