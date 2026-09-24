@@ -138,8 +138,8 @@ bool ConntrackAdaptiveSetHostStrategy(uint32_t profile_id, const char *host,
 bool ConntrackAdaptiveClearHostStrategy(uint32_t profile_id, const char *host);
 bool ConntrackAdaptiveGetHostStrategy(uint32_t profile_id, const char *host,
 	uint32_t *strategy_id, uint64_t *generation);
-bool ConntrackAdaptiveLookupCanaryStrategy(uint32_t profile_id, const char *host,
-	uint32_t *strategy_id);
+bool ConntrackAdaptiveLookupCanaryStrategy(const t_ctrack *track, uint32_t profile_id,
+	const char *host, uint32_t *strategy_id);
 // host-scoped telemetry event on the adaptive bus (autoexclude engine)
 void adaptive_emit_host(const char *event, const char *host, const char *payload, uint32_t profile_id, uint32_t strategy_id);
 

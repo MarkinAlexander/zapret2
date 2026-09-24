@@ -724,10 +724,17 @@ bool ConntrackAdaptiveGetHostStrategy(uint32_t profile_id, const char *host,
 	return true;
 }
 
-bool ConntrackAdaptiveLookupCanaryStrategy(uint32_t profile_id, const char *host,
-	uint32_t *strategy_id)
+bool ConntrackAdaptiveLookupCanaryStrategy(const t_ctrack *track, uint32_t profile_id,
+	const char *host, uint32_t *strategy_id)
 {
 	if (!profile_id || profile_id != params.adaptive_canary_profile) return false;
+	if (track && track->strategy_assigned) {
+		if (track->profile_id == profile_id && !strcmp(track->adaptive_scope, "production_canary")) {
+			if (strategy_id) *strategy_id = track->strategy_id;
+			return true;
+		}
+		return false;
+	}
 	return ConntrackAdaptiveGetHostStrategy(profile_id, host, strategy_id, NULL);
 }
 
