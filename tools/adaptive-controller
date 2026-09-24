@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Small Unix-datagram client for the nfqws2 adaptive control endpoint."""
+
+import argparse
+import os
+import re
+import socket
+import sys
+import tempfile
+
+
+ACK_RE = re.compile(rb"ACK\t1\tOK\t([0-9]+)\t([0-9]+)\t([0-9]+)\n\Z")
+
+
+def get_candidate(server_path: str) -> int:
+    if not os.path.isabs(server_path):
+        print("adaptive-controller: worker socket path must be absolute", file=sys.stderr)
+        return 2
+
+    local_dir = tempfile.mkdtemp(prefix="z2r-adaptive-")
+    os.chmod(local_dir, 0o700)
+    local_path = os.path.join(local_dir, "worker.sock")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.bind(local_path)
+        os.chmod(local_path, 0o600)
+        client.settimeout(3.0)
+        client.sendto(b"GET_CANDIDATE\t1\n", server_path)
+        reply = client.recv(256)
+    except OSError as exc:
+        print(f"adaptive-controller: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        client.close()
+        try:
+            os.unlink(local_path)
+        except FileNotFoundError:
+            pass
+        os.rmdir(local_dir)
+
+    if reply == b"ACK\t1\tERR\tno_candidate\n":
+        print("adaptive-controller: worker has no candidate", file=sys.stderr)
+        return 1
+    match = ACK_RE.fullmatch(reply)
+    if not match:
+        print("adaptive-controller: invalid worker response", file=sys.stderr)
+        return 1
+    profile, strategy, generation = (int(value) for value in match.groups())
+    print(f"candidate_current\tprofile={profile}\tstrategy={strategy}\tgeneration={generation}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="adaptive-controller")
+    parser.add_argument("--get-candidate", metavar="WORKER_SOCKET", required=True)
+    args = parser.parse_args()
+    return get_candidate(args.get_candidate)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

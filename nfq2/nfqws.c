@@ -540,15 +540,23 @@ static void adaptive_control_handle(int fd)
 		peer.sun_family == AF_UNIX && peer.sun_path[0]) peer_can_reply = true;
 	if (peer_can_reply && (size_t)n < sizeof(request) && n > 0) {
 		request[n] = 0;
-		cursor = request;
-		if (!strncmp(cursor, "SET_CANDIDATE\t1\t", sizeof("SET_CANDIDATE\t1\t") - 1)) {
-			cursor += sizeof("SET_CANDIDATE\t1\t") - 1;
-			if (adaptive_parse_uint32(&cursor, '\t', &profile) &&
-				adaptive_parse_uint32(&cursor, '\n', &strategy) && cursor == request + n &&
-				profile && strategy && profile == params.adaptive_strategy_profile &&
-				adaptive_profile_exists(profile)) {
-				ConntrackAdaptiveSetCandidate(profile, strategy);
-				status = "ok";
+		if ((size_t)n == sizeof("GET_CANDIDATE\t1\n")-1 &&
+			!memcmp(request, "GET_CANDIDATE\t1\n", sizeof("GET_CANDIDATE\t1\n")-1)) {
+			profile = params.adaptive_strategy_profile;
+			strategy = params.adaptive_strategy_id;
+			if (profile && strategy && adaptive_profile_exists(profile)) status = "ok";
+			else status = "no_candidate";
+		} else {
+			cursor = request;
+			if (!strncmp(cursor, "SET_CANDIDATE\t1\t", sizeof("SET_CANDIDATE\t1\t") - 1)) {
+				cursor += sizeof("SET_CANDIDATE\t1\t") - 1;
+				if (adaptive_parse_uint32(&cursor, '\t', &profile) &&
+					adaptive_parse_uint32(&cursor, '\n', &strategy) && cursor == request + n &&
+					profile && strategy && profile == params.adaptive_strategy_profile &&
+					adaptive_profile_exists(profile)) {
+					ConntrackAdaptiveSetCandidate(profile, strategy);
+					status = "ok";
+				}
 			}
 		}
 	}
@@ -2002,7 +2010,7 @@ static void exithelp(void)
 		" --adaptive-events=<file|unix:path>\t\t; append TSV or send nonblocking Unix datagrams (optional)\n"
 		" --adaptive-strategy=<profile>:<strategy>\t; pin only that profile to one controller-selected learning strategy\n"
 #ifdef __linux__
-		" --adaptive-control=<unix_path>\t\t; private Unix datagram SET_CANDIDATE v1 endpoint (optional)\n"
+		" --adaptive-control=<unix_path>\t\t; private Unix datagram SET/GET_CANDIDATE v1 endpoint (optional)\n"
 #endif
 		" --payload-disable=[type[,type]]\t\t\t; do not discover these payload types. for available payload types see '--payload'. disable all if no argument.\n"
 		" --server=[0|1]\t\t\t\t\t\t; change multiple aspects of src/dst ip/port handling for incoming connections\n"
