@@ -443,7 +443,8 @@ static void notify_ready(void)
 }
 
 #ifdef __linux__
-#define ADAPTIVE_CONTROL_MAX 256
+/* The control datagram is bounded, while host names use their DNS wire limit. */
+#define ADAPTIVE_CONTROL_MAX 384
 static int adaptive_control_open(void)
 {
 	struct sockaddr_un addr;
@@ -501,6 +502,38 @@ static bool adaptive_profile_exists(uint32_t profile_id)
 	return false;
 }
 
+static bool adaptive_host_valid(char *host)
+{
+	size_t len, label = 0, i;
+	if (!host || !(len = strlen(host)) || len > 253 || host[0] == '.' || host[len - 1] == '.') return false;
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)host[i];
+		if (c == '.') {
+			if (!label || label > 63 || host[i - 1] == '-') return false;
+			label = 0;
+		} else if (isalnum(c) || c == '-') {
+			if (!label && c == '-') return false;
+			label++;
+		} else return false;
+		host[i] = (char)tolower(c);
+	}
+	return label > 0 && label <= 63 && host[len - 1] != '-';
+}
+
+static bool adaptive_parse_host(const char **cursor, char delimiter, char host[256])
+{
+	const char *end = strchr(*cursor, delimiter);
+	size_t len;
+	if (!end || end == *cursor) return false;
+	len = (size_t)(end - *cursor);
+	if (len >= 256) return false;
+	memcpy(host, *cursor, len);
+	host[len] = 0;
+	if (!adaptive_host_valid(host)) return false;
+	*cursor = end + 1;
+	return true;
+}
+
 static bool adaptive_parse_uint32(const char **cursor, char delimiter, uint32_t *value)
 {
 	const char *p = *cursor;
@@ -520,12 +553,13 @@ static bool adaptive_parse_uint32(const char **cursor, char delimiter, uint32_t 
 
 static void adaptive_control_handle(int fd)
 {
-	char request[ADAPTIVE_CONTROL_MAX], reply[192];
+	char request[ADAPTIVE_CONTROL_MAX], reply[192], host[256];
 	struct sockaddr_un peer;
 	const char *cursor;
 	socklen_t peer_len = sizeof(peer);
 	ssize_t n;
 	uint32_t profile = 0, strategy = 0;
+	uint64_t generation = 0;
 	int nr;
 	const char *status = "invalid_request";
 	bool peer_can_reply = false;
@@ -546,6 +580,32 @@ static void adaptive_control_handle(int fd)
 			strategy = params.adaptive_strategy_id;
 			if (profile && strategy && adaptive_profile_exists(profile)) status = "ok";
 			else status = "no_candidate";
+		} else if (params.adaptive_canary_profile &&
+			!strncmp(request, "SET_HOST_STRATEGY\t1\t", sizeof("SET_HOST_STRATEGY\t1\t") - 1)) {
+			cursor = request + sizeof("SET_HOST_STRATEGY\t1\t") - 1;
+			if (adaptive_parse_uint32(&cursor, '\t', &profile) &&
+				adaptive_parse_host(&cursor, '\t', host) &&
+				adaptive_parse_uint32(&cursor, '\n', &strategy) && cursor == request + n &&
+				profile == params.adaptive_canary_profile && strategy && adaptive_profile_exists(profile)) {
+				if (ConntrackAdaptiveSetHostStrategy(profile, host, strategy, &generation)) status = "ok";
+				else status = "host_table_full";
+			}
+		} else if (params.adaptive_canary_profile &&
+			!strncmp(request, "GET_HOST_STRATEGY\t1\t", sizeof("GET_HOST_STRATEGY\t1\t") - 1)) {
+			cursor = request + sizeof("GET_HOST_STRATEGY\t1\t") - 1;
+			if (adaptive_parse_uint32(&cursor, '\t', &profile) &&
+				adaptive_parse_host(&cursor, '\n', host) && cursor == request + n &&
+				profile == params.adaptive_canary_profile &&
+				ConntrackAdaptiveGetHostStrategy(profile, host, &strategy, &generation)) status = "ok";
+			else if (profile == params.adaptive_canary_profile) status = "no_host_strategy";
+		} else if (params.adaptive_canary_profile &&
+			!strncmp(request, "CLEAR_HOST_STRATEGY\t1\t", sizeof("CLEAR_HOST_STRATEGY\t1\t") - 1)) {
+			cursor = request + sizeof("CLEAR_HOST_STRATEGY\t1\t") - 1;
+			if (adaptive_parse_uint32(&cursor, '\t', &profile) &&
+				adaptive_parse_host(&cursor, '\n', host) && cursor == request + n &&
+				profile == params.adaptive_canary_profile &&
+				ConntrackAdaptiveClearHostStrategy(profile, host)) status = "ok";
+			else if (profile == params.adaptive_canary_profile) status = "no_host_strategy";
 		} else {
 			cursor = request;
 			if (!strncmp(cursor, "SET_CANDIDATE\t1\t", sizeof("SET_CANDIDATE\t1\t") - 1)) {
@@ -562,7 +622,7 @@ static void adaptive_control_handle(int fd)
 	}
 	if (!strcmp(status, "ok"))
 		nr = snprintf(reply, sizeof(reply), "ACK\t1\tOK\t%u\t%u\t%llu\n", profile, strategy,
-			(unsigned long long)ConntrackAdaptiveCandidateGeneration());
+			(unsigned long long)(generation ? generation : ConntrackAdaptiveCandidateGeneration()));
 	else
 		nr = snprintf(reply, sizeof(reply), "ACK\t1\tERR\t%s\n", status);
 	if (peer_can_reply && nr > 0 && (size_t)nr < sizeof(reply))
@@ -591,6 +651,12 @@ static int nfq_main(void)
 	if (*params.pidfile && !(Fpid = fopen(params.pidfile, "w")))
 	{
 		DLOG_PERROR("create pidfile");
+		return 1;
+	}
+	if (params.adaptive_canary_profile &&
+		(!*params.adaptive_control_socket || !adaptive_profile_exists(params.adaptive_canary_profile) ||
+		 params.adaptive_strategy_profile == params.adaptive_canary_profile)) {
+		DLOG_ERR("adaptive canary profile requires --adaptive-control, an existing profile, and no global strategy pin on that profile\n");
 		return 1;
 	}
 	/* Connect while privileged: the controller socket is deliberately private. */
@@ -2010,7 +2076,8 @@ static void exithelp(void)
 		" --adaptive-events=<file|unix:path>\t\t; append TSV or send nonblocking Unix datagrams (optional)\n"
 		" --adaptive-strategy=<profile>:<strategy>\t; pin only that profile to one controller-selected learning strategy\n"
 #ifdef __linux__
-		" --adaptive-control=<unix_path>\t\t; private Unix datagram SET/GET_CANDIDATE v1 endpoint (optional)\n"
+		" --adaptive-control=<unix_path>\t\t; private Unix datagram candidate/host strategy endpoint (optional)\n"
+		" --adaptive-canary-profile=<profile>\t; allow up to 64 host-scoped assignments for this profile\n"
 #endif
 		" --payload-disable=[type[,type]]\t\t\t; do not discover these payload types. for available payload types see '--payload'. disable all if no argument.\n"
 		" --server=[0|1]\t\t\t\t\t\t; change multiple aspects of src/dst ip/port handling for incoming connections\n"
@@ -2213,6 +2280,7 @@ enum opt_indices {
 	IDX_ADAPTIVE_STRATEGY,
 #ifdef __linux__
 	IDX_ADAPTIVE_CONTROL,
+	IDX_ADAPTIVE_CANARY_PROFILE,
 #endif
 	IDX_PAYLOAD_DISABLE,
 	IDX_SERVER,
@@ -2355,6 +2423,7 @@ static const struct option long_options[] = {
 	[IDX_ADAPTIVE_STRATEGY] = {"adaptive-strategy", required_argument, 0, 0},
 #ifdef __linux__
 	[IDX_ADAPTIVE_CONTROL] = {"adaptive-control", required_argument, 0, 0},
+	[IDX_ADAPTIVE_CANARY_PROFILE] = {"adaptive-canary-profile", required_argument, 0, 0},
 #endif
 	[IDX_PAYLOAD_DISABLE] = {"payload-disable", optional_argument, 0, 0},
 	[IDX_SERVER] = {"server", optional_argument, 0, 0},
@@ -2802,6 +2871,18 @@ int main(int argc, char **argv)
 			}
 			strcpy(params.adaptive_control_socket, optarg);
 			break;
+		case IDX_ADAPTIVE_CANARY_PROFILE:
+		{
+			unsigned long profile;
+			char trailing;
+			if (!optarg || sscanf(optarg, "%lu%c", &profile, &trailing) != 1 ||
+				!profile || profile > UINT32_MAX) {
+				DLOG_ERR("--adaptive-canary-profile must be a positive profile integer\n");
+				exit_clean(1);
+			}
+			params.adaptive_canary_profile = (uint32_t)profile;
+			break;
+		}
 #endif
 		case IDX_SERVER:
 			params.server = !optarg || atoi(optarg);

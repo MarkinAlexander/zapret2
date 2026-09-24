@@ -228,6 +228,7 @@ struct params_s
 	char adaptive_control_socket[PATH_MAX]; // optional local Unix datagram controller endpoint
 	uint32_t adaptive_strategy_profile; // optional controller-pinned learning profile
 	uint32_t adaptive_strategy_id; // optional controller-pinned learning strategy
+	uint32_t adaptive_canary_profile; // optional profile accepting host-scoped strategy assignments
 	unsigned int ctrack_t_syn, ctrack_t_est, ctrack_t_fin, ctrack_t_udp;
 	t_conntrack conntrack;
 	bool ctrack_disable, server;

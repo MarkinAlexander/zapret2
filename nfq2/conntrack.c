@@ -20,6 +20,14 @@ static void taddr2str(uint8_t l3proto, const t_addr *a, char *buf, size_t bufsiz
 static uint64_t adaptive_flow_seq = 1;
 static uint64_t adaptive_strategy_seq = 1;
 static uint64_t adaptive_candidate_generation = 1;
+static uint64_t adaptive_host_strategy_generation = 1;
+struct adaptive_host_strategy {
+	bool used;
+	uint32_t profile_id, strategy_id;
+	uint64_t generation;
+	char host[256];
+};
+static struct adaptive_host_strategy adaptive_host_strategies[ADAPTIVE_HOST_STRATEGIES_MAX];
 #define ADAPTIVE_EVENTS_MAX_BYTES (4U * 1024U * 1024U)
 static bool adaptive_trace_limited;
 static const char adaptive_trace_limit_marker[] = "# TRACE_LIMIT\tmax_bytes=4194304\n";
@@ -646,6 +654,17 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 {
 	bool pinned;
 	if (!track || !track->flow_id || !profile_id || !strategy_id) return false;
+	if (!track->strategy_assigned && scope && !strcmp(scope, "production_canary") &&
+		profile_id == params.adaptive_canary_profile && track->hostname) {
+		uint32_t canary_strategy;
+		uint64_t canary_generation;
+		if (ConntrackAdaptiveGetHostStrategy(profile_id, track->hostname,
+			&canary_strategy, &canary_generation)) {
+			track->candidate_profile_id = profile_id;
+			track->candidate_strategy_id = canary_strategy;
+			track->candidate_generation = canary_generation;
+		}
+	}
 	pinned = track->candidate_profile_id == profile_id && track->candidate_strategy_id;
 	if (track->strategy_assigned) {
 		if ((track->profile_id != profile_id || (!pinned && track->strategy_id != strategy_id) ||
@@ -677,4 +696,72 @@ void ConntrackAdaptiveSetCandidate(uint32_t profile_id, uint32_t strategy_id)
 uint64_t ConntrackAdaptiveCandidateGeneration(void)
 {
 	return adaptive_candidate_generation;
+}
+
+static struct adaptive_host_strategy *adaptive_host_strategy_find(uint32_t profile_id, const char *host)
+{
+	unsigned i;
+	const char *left, *right;
+	if (!profile_id || !host || !*host || strlen(host) >= sizeof(adaptive_host_strategies[0].host)) return NULL;
+	for (i = 0; i < ADAPTIVE_HOST_STRATEGIES_MAX; i++) {
+		if (!adaptive_host_strategies[i].used || adaptive_host_strategies[i].profile_id != profile_id) continue;
+		left = adaptive_host_strategies[i].host; right = host;
+		while (*left && *right && tolower((unsigned char)*left) == tolower((unsigned char)*right)) {
+			left++; right++;
+		}
+		if (!*left && !*right) return &adaptive_host_strategies[i];
+	}
+	return NULL;
+}
+
+bool ConntrackAdaptiveGetHostStrategy(uint32_t profile_id, const char *host,
+	uint32_t *strategy_id, uint64_t *generation)
+{
+	struct adaptive_host_strategy *entry = adaptive_host_strategy_find(profile_id, host);
+	if (!entry) return false;
+	if (strategy_id) *strategy_id = entry->strategy_id;
+	if (generation) *generation = entry->generation;
+	return true;
+}
+
+bool ConntrackAdaptiveLookupCanaryStrategy(uint32_t profile_id, const char *host,
+	uint32_t *strategy_id)
+{
+	if (!profile_id || profile_id != params.adaptive_canary_profile) return false;
+	return ConntrackAdaptiveGetHostStrategy(profile_id, host, strategy_id, NULL);
+}
+
+bool ConntrackAdaptiveSetHostStrategy(uint32_t profile_id, const char *host,
+	uint32_t strategy_id, uint64_t *generation)
+{
+	struct adaptive_host_strategy *entry = adaptive_host_strategy_find(profile_id, host), *free_entry = NULL;
+	unsigned i;
+	if (!profile_id || profile_id != params.adaptive_canary_profile || !strategy_id || !host || !*host ||
+		strlen(host) >= sizeof(adaptive_host_strategies[0].host) ||
+		adaptive_host_strategy_generation == UINT64_MAX) return false;
+	if (!entry) {
+		for (i = 0; i < ADAPTIVE_HOST_STRATEGIES_MAX; i++)
+			if (!adaptive_host_strategies[i].used) { free_entry = &adaptive_host_strategies[i]; break; }
+		if (!free_entry) return false;
+		entry = free_entry;
+		memset(entry, 0, sizeof(*entry));
+		if (snprintf(entry->host, sizeof(entry->host), "%s", host) >= (int)sizeof(entry->host)) return false;
+		entry->profile_id = profile_id;
+		entry->used = true;
+	}
+	entry->strategy_id = strategy_id;
+	adaptive_host_strategy_generation++;
+	entry->generation = adaptive_host_strategy_generation;
+	if (generation) *generation = entry->generation;
+	return true;
+}
+
+bool ConntrackAdaptiveClearHostStrategy(uint32_t profile_id, const char *host)
+{
+	struct adaptive_host_strategy *entry;
+	if (!profile_id || profile_id != params.adaptive_canary_profile) return false;
+	entry = adaptive_host_strategy_find(profile_id, host);
+	if (!entry) return false;
+	memset(entry, 0, sizeof(*entry));
+	return true;
 }

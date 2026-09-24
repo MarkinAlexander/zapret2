@@ -30,6 +30,7 @@
 #define RETRANS_COUNTER_STOP ((uint8_t)-1)
 
 #define RAW_PACKET_QUEUE_DELAYED_MAX	64
+#define ADAPTIVE_HOST_STRATEGIES_MAX 64
 
 typedef union {
 	struct in_addr ip;
@@ -132,6 +133,13 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 	const char *scope, uint32_t *selected_strategy);
 void ConntrackAdaptiveSetCandidate(uint32_t profile_id, uint32_t strategy_id);
 uint64_t ConntrackAdaptiveCandidateGeneration(void);
+bool ConntrackAdaptiveSetHostStrategy(uint32_t profile_id, const char *host,
+	uint32_t strategy_id, uint64_t *generation);
+bool ConntrackAdaptiveClearHostStrategy(uint32_t profile_id, const char *host);
+bool ConntrackAdaptiveGetHostStrategy(uint32_t profile_id, const char *host,
+	uint32_t *strategy_id, uint64_t *generation);
+bool ConntrackAdaptiveLookupCanaryStrategy(uint32_t profile_id, const char *host,
+	uint32_t *strategy_id);
 // host-scoped telemetry event on the adaptive bus (autoexclude engine)
 void adaptive_emit_host(const char *event, const char *host, const char *payload, uint32_t profile_id, uint32_t strategy_id);
 

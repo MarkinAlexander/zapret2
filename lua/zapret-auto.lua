@@ -344,6 +344,23 @@ function circular(ctx, desync)
 		DLOG_ERR("circular: conntrack is missing but required")
 		return
 	end
+	-- A controller-managed canary flow bypasses legacy nstrategy rotation.
+	if flow_strategy_canary_get then
+		local canary = flow_strategy_canary_get(desync)
+		if canary then
+			local selected = flow_strategy_assign(desync, canary, "production_canary")
+			if selected ~= canary then return VERDICT_PASS end
+			local verdict = VERDICT_PASS
+			while true do
+				local instance = plan_instance_pop(desync)
+				if not instance then break end
+				if instance.arg.strategy and tonumber(instance.arg.strategy)==selected then
+					verdict = plan_instance_execute(desync, verdict, instance)
+				end
+			end
+			return verdict
+		end
+	end
 
 	local hrec = automate_host_record(desync)
 	if not hrec then
