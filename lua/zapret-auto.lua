@@ -374,7 +374,10 @@ function circular(ctx, desync)
 
 	DLOG("circular: current strategy "..hrec.nstrategy)
 	-- Optional C-side flow attribution only; legacy selection remains unchanged.
-	if flow_strategy_assign then flow_strategy_assign(desync, hrec.nstrategy, "default") end
+	if flow_strategy_assign then
+		local selected = flow_strategy_assign(desync, hrec.nstrategy, "default")
+		if selected then hrec.nstrategy = selected end
+	end
 	while true do
 		local instance = plan_instance_pop(desync)
 		if not instance then break end

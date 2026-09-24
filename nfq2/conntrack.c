@@ -620,22 +620,28 @@ bool ReasmHasSpace(t_reassemble *reasm, size_t len)
 	return (reasm->size_present + len) <= reasm->size;
 }
 
-bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strategy_id, const char *scope)
+bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strategy_id,
+	const char *scope, uint32_t *selected_strategy)
 {
+	bool pinned;
 	if (!track || !track->flow_id || !profile_id || !strategy_id) return false;
+	pinned = params.adaptive_strategy_profile == profile_id && params.adaptive_strategy_id;
 	if (track->strategy_assigned) {
-		if ((track->profile_id != profile_id || track->strategy_id != strategy_id ||
+		if ((track->profile_id != profile_id || (!pinned && track->strategy_id != strategy_id) ||
 			strcmp(track->adaptive_scope, scope ? scope : "default")) && !track->strategy_conflict) {
 			track->strategy_conflict = true;
 			adaptive_emit(track, "STRATEGY_CONFLICT", "legacy_selection_changed");
 		}
-		return track->profile_id == profile_id && track->strategy_id == strategy_id;
+		if (selected_strategy) *selected_strategy = track->strategy_id;
+		return track->profile_id == profile_id && (pinned || track->strategy_id == strategy_id);
 	}
+	if (pinned) strategy_id = params.adaptive_strategy_id;
 	track->profile_id = profile_id;
 	track->strategy_id = strategy_id;
 	snprintf(track->adaptive_scope, sizeof(track->adaptive_scope), "%s", scope ? scope : "default");
 	track->strategy_generation = adaptive_strategy_seq++;
 	track->strategy_assigned = true;
 	adaptive_emit(track, "STRATEGY_APPLIED", "");
+	if (selected_strategy) *selected_strategy = strategy_id;
 	return true;
 }

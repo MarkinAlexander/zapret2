@@ -1087,9 +1087,13 @@ static int luacall_flow_strategy_assign(lua_State *L)
 	lua_Integer strategy = luaL_checkinteger(L,2);
 	const char *scope = luaL_checkstring(L,3);
 	uint32_t profile = ctx->dp ? ctx->dp->n : 0;
-	if (ctx->ctrack && strategy > 0 && strategy <= UINT32_MAX)
-		(void)ConntrackSetStrategy(ctx->ctrack, profile, (uint32_t)strategy, scope);
-	return 0;
+	uint32_t selected = 0;
+	if (ctx->ctrack && strategy > 0 && strategy <= UINT32_MAX &&
+		ConntrackSetStrategy(ctx->ctrack, profile, (uint32_t)strategy, scope, &selected))
+		lua_pushinteger(L, selected);
+	else
+		lua_pushnil(L);
+	return 1;
 }
 
 static int luacall_execution_plan_cancel(lua_State *L)

@@ -126,7 +126,8 @@ bool ConntrackExtractConn(t_conn *c, bool bReverse, const struct dissect *dis);
 void ConntrackPoolDump(const t_conntrack *p);
 void ConntrackPoolPurge(t_conntrack *p);
 void ConntrackClearHostname(t_ctrack *track);
-bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strategy_id, const char *scope);
+bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strategy_id,
+	const char *scope, uint32_t *selected_strategy);
 // host-scoped telemetry event on the adaptive bus (autoexclude engine)
 void adaptive_emit_host(const char *event, const char *host, const char *payload, uint32_t profile_id, uint32_t strategy_id);
 
