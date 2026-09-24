@@ -224,6 +224,7 @@ struct params_s
 	// LUA var blobs
 	struct blob_collection_head blobs;
 
+	char adaptive_events_file[PATH_MAX]; // optional C-side TSV event sink
 	unsigned int ctrack_t_syn, ctrack_t_est, ctrack_t_fin, ctrack_t_udp;
 	t_conntrack conntrack;
 	bool ctrack_disable, server;

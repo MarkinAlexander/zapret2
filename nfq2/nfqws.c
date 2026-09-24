@@ -46,6 +46,7 @@
 
 #ifdef __linux__
 #include <sys/ioctl.h>
+#include <sys/un.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 #define NF_DROP 0
 #define NF_ACCEPT 1
@@ -1861,6 +1862,7 @@ static void exithelp(void)
 #endif
 		" --ctrack-timeouts=S:E:F[:U]\t\t\t\t; internal conntrack timeouts for TCP SYN, ESTABLISHED, FIN stages, UDP timeout. default %u:%u:%u:%u\n"
 		" --ctrack-disable=[0|1]\t\t\t\t\t; 1 or no argument disables conntrack\n"
+		" --adaptive-events=<file|unix:path>\t\t; append TSV or send nonblocking Unix datagrams (optional)\n"
 		" --payload-disable=[type[,type]]\t\t\t; do not discover these payload types. for available payload types see '--payload'. disable all if no argument.\n"
 		" --server=[0|1]\t\t\t\t\t\t; change multiple aspects of src/dst ip/port handling for incoming connections\n"
 		" --ipcache-lifetime=<int>\t\t\t\t; time in seconds to keep cached hop count and domain name (default %u). 0 = no expiration\n"
@@ -2058,6 +2060,7 @@ enum opt_indices {
 #endif
 	IDX_CTRACK_TIMEOUTS,
 	IDX_CTRACK_DISABLE,
+	IDX_ADAPTIVE_EVENTS,
 	IDX_PAYLOAD_DISABLE,
 	IDX_SERVER,
 	IDX_IPCACHE_LIFETIME,
@@ -2195,6 +2198,7 @@ static const struct option long_options[] = {
 #endif
 	[IDX_CTRACK_TIMEOUTS] = {"ctrack-timeouts", required_argument, 0, 0},
 	[IDX_CTRACK_DISABLE] = {"ctrack-disable", optional_argument, 0, 0},
+	[IDX_ADAPTIVE_EVENTS] = {"adaptive-events", required_argument, 0, 0},
 	[IDX_PAYLOAD_DISABLE] = {"payload-disable", optional_argument, 0, 0},
 	[IDX_SERVER] = {"server", optional_argument, 0, 0},
 	[IDX_IPCACHE_LIFETIME] = {"ipcache-lifetime", required_argument, 0, 0},
@@ -2596,6 +2600,27 @@ int main(int argc, char **argv)
 			break;
 		case IDX_CTRACK_DISABLE:
 			params.ctrack_disable = !optarg || atoi(optarg);
+			break;
+		case IDX_ADAPTIVE_EVENTS:
+			if (!optarg || !*optarg || strlen(optarg) >= sizeof(params.adaptive_events_file))
+			{
+				DLOG_ERR("bad value for --adaptive-events\n");
+				exit_clean(1);
+			}
+			if (!strncmp(optarg, "unix:", 5))
+			{
+#ifdef __linux__
+				if (optarg[5] != '/' || strlen(optarg + 5) >= sizeof(((struct sockaddr_un *)0)->sun_path))
+				{
+					DLOG_ERR("invalid Unix socket path for --adaptive-events\n");
+					exit_clean(1);
+				}
+#else
+				DLOG_ERR("Unix socket mode for --adaptive-events requires Linux\n");
+				exit_clean(1);
+#endif
+			}
+			strcpy(params.adaptive_events_file, optarg);
 			break;
 		case IDX_SERVER:
 			params.server = !optarg || atoi(optarg);

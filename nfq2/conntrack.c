@@ -7,6 +7,129 @@
 #include "params.h"
 #include "lua.h"
 
+#include <inttypes.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
+
+static void taddr2str(uint8_t l3proto, const t_addr *a, char *buf, size_t bufsize);
+static uint64_t adaptive_flow_seq = 1;
+static uint64_t adaptive_strategy_seq = 1;
+#define ADAPTIVE_EVENTS_MAX_BYTES (4U * 1024U * 1024U)
+static bool adaptive_trace_limited;
+static const char adaptive_trace_limit_marker[] = "# TRACE_LIMIT\tmax_bytes=4194304\n";
+#ifdef __linux__
+static int adaptive_event_socket = -1;
+static uint64_t adaptive_event_drops;
+
+static void adaptive_note_drop(void)
+{
+	if (adaptive_event_drops != UINT64_MAX) adaptive_event_drops++;
+}
+
+static bool adaptive_send_unix(const char *path, const char *line, size_t len)
+{
+	struct sockaddr_un addr;
+	int flags;
+	ssize_t sent;
+	if (adaptive_event_socket < 0) {
+		adaptive_event_socket = socket(AF_UNIX, SOCK_DGRAM, 0);
+		if (adaptive_event_socket < 0) { adaptive_note_drop(); return false; }
+		flags = fcntl(adaptive_event_socket, F_GETFL, 0);
+		if (flags < 0 || fcntl(adaptive_event_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
+			close(adaptive_event_socket);
+			adaptive_event_socket = -1;
+			adaptive_note_drop();
+			return false;
+		}
+	}
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path) >= (int)sizeof(addr.sun_path)) {
+		adaptive_note_drop();
+		return false;
+	}
+	if (adaptive_event_drops) {
+		char gap[64];
+		int n = snprintf(gap, sizeof(gap), "# EVENT_GAP\t%" PRIu64 "\n", adaptive_event_drops);
+		if (n <= 0 || (size_t)n >= sizeof(gap)) { adaptive_note_drop(); return false; }
+		sent = sendto(adaptive_event_socket, gap, (size_t)n, MSG_DONTWAIT,
+			(const struct sockaddr *)&addr, sizeof(addr));
+		if (sent != n) { adaptive_note_drop(); return false; }
+		adaptive_event_drops = 0;
+	}
+	sent = sendto(adaptive_event_socket, line, len, MSG_DONTWAIT,
+		(const struct sockaddr *)&addr, sizeof(addr));
+	if (sent != (ssize_t)len) { adaptive_note_drop(); return false; }
+	return true;
+}
+#endif
+
+static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
+{
+	int fd;
+	struct stat st;
+	char scope[64], host[256], dst[INET6_ADDRSTRLEN], line[1200];
+	char *h;
+	int n;
+	struct timespec wall;
+	if (!params.adaptive_events_file[0] || !t || !t->flow_id) return;
+	snprintf(scope, sizeof(scope), "%s", t->adaptive_scope[0] ? t->adaptive_scope : "default");
+	for (h=scope; *h; h++) if (*h=='\t' || *h=='\r' || *h=='\n') *h='_';
+	h = t->hostname ? t->hostname : "";
+	snprintf(host, sizeof(host), "%s", h);
+	for (h=host; *h; h++) if (*h=='\t' || *h=='\r' || *h=='\n') *h='_';
+	taddr2str(t->tuple.l3proto, &t->tuple.dst, dst, sizeof(dst));
+	clock_gettime(CLOCK_REALTIME, &wall);
+	n = snprintf(line, sizeof(line),
+		"v2\t%llu\t%s\t%" PRIu64 "\t%u\t%u\t%" PRIu64 "\t%s\t%s\t%s\t%s\t%s\t%u\t%llu\t%llu\t%llu\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%llu\t%llu\t%u\t%u\t%s\n",
+		(unsigned long long)wall.tv_sec*1000 + wall.tv_nsec/1000000, event, t->flow_id, t->profile_id, t->strategy_id,
+		t->strategy_generation, scope, host, t->tuple.l4proto==IPPROTO_TCP ? "tcp" : (t->l7proto==L7_QUIC ? "quic" : "udp"),
+		t->tuple.l3proto==IPPROTO_IPV6 ? "ipv6" : "ipv4", dst, ntohs(t->tuple.dport),
+		(unsigned long long)t->pos.client.pcounter, (unsigned long long)t->pos.server.pcounter,
+		(unsigned long long)t->pos.client.pbcounter, (unsigned long long)t->pos.server.pbcounter,
+		t->pos.server.pcounter>0, t->pos.server.pbcounter>0, t->client_rst, t->server_rst,
+		t->client_fin, t->server_fin, (unsigned long long)t->t_start.tv_sec*1000 + t->t_start.tv_nsec/1000000,
+		(unsigned long long)t->pos.t_last.tv_sec*1000 + t->pos.t_last.tv_nsec/1000000,
+		(unsigned)t->clienthello_count, (unsigned)t->clienthello_retransmissions,
+		reason ? reason : "");
+	if (n<=0 || (size_t)n>=sizeof(line)) return;
+	if (!strncmp(params.adaptive_events_file, "unix:", 5)) {
+#ifdef __linux__
+		(void)adaptive_send_unix(params.adaptive_events_file + 5, line, (size_t)n);
+#endif
+		return;
+	}
+	fd=open(params.adaptive_events_file, O_WRONLY|O_CREAT|O_APPEND, 0600);
+	if (fd<0) return;
+	(void)fchmod(fd, 0600);
+	if (adaptive_trace_limited || fstat(fd, &st)<0 || st.st_size<0) {
+		close(fd);
+		return;
+	}
+	/* Reserve room for an explicit truncation marker; never grow /tmp without bound. */
+	if ((uint64_t)st.st_size + (uint64_t)n >
+		ADAPTIVE_EVENTS_MAX_BYTES - (sizeof(adaptive_trace_limit_marker)-1)) {
+		if ((uint64_t)st.st_size + sizeof(adaptive_trace_limit_marker)-1 <= ADAPTIVE_EVENTS_MAX_BYTES) {
+			ssize_t written = write(fd, adaptive_trace_limit_marker, sizeof(adaptive_trace_limit_marker)-1);
+			if (written != (ssize_t)(sizeof(adaptive_trace_limit_marker)-1)) adaptive_trace_limited = true;
+		}
+		adaptive_trace_limited = true;
+		close(fd);
+		return;
+	}
+	{
+		ssize_t written = write(fd, line, (size_t)n);
+		if (written != n) adaptive_trace_limited = true;
+	}
+	close(fd);
+}
+
+
 #undef uthash_nonfatal_oom
 #define uthash_nonfatal_oom(elt) ut_oom_recover(elt)
 
@@ -53,7 +176,11 @@ static void ConntrackFreeElem(t_conntrack_pool *elem)
 static void ConntrackPoolDestroyPool(t_conntrack_pool **pp)
 {
 	t_conntrack_pool *elem, *tmp;
-	HASH_ITER(hh, *pp, elem, tmp) { HASH_DEL(*pp, elem); ConntrackFreeElem(elem); }
+	HASH_ITER(hh, *pp, elem, tmp) {
+		adaptive_emit(&elem->track, "FLOW_END", "process_exit");
+		HASH_DEL(*pp, elem);
+		ConntrackFreeElem(elem);
+	}
 }
 void ConntrackPoolDestroy(t_conntrack *p)
 {
@@ -173,33 +300,38 @@ static void ConntrackApplyPos(t_ctrack *t, bool bReverse, const struct dissect *
 
 static void ConntrackFeedPacket(t_ctrack *t, bool bReverse, const struct dissect *dis)
 {
-	if (bReverse)
+	if (!bReverse && dis->tcp && dis->len_payload &&
+		IsTLSClientHelloPartial(dis->data_payload, dis->len_payload))
 	{
-		t->pos.server.pcounter++;
-		t->pos.server.pdcounter += !!dis->len_payload;
-		t->pos.server.pbcounter += dis->len_payload;
-	}
-
-	else
-	{
-		t->pos.client.pcounter++;
-		t->pos.client.pdcounter += !!dis->len_payload;
-		t->pos.client.pbcounter += dis->len_payload;
+		uint32_t seq = ntohl(dis->tcp->th_seq);
+		t->clienthello_count++;
+		if (t->clienthello_seq_seen && seq == t->clienthello_first_seq)
+			t->clienthello_retransmissions++;
+		else if (!t->clienthello_seq_seen)
+		{
+			t->clienthello_seq_seen = true;
+			t->clienthello_first_seq = seq;
+		}
 	}
 
 	if (dis->tcp)
 	{
 		if (tcp_syn_segment(dis->tcp))
 		{
-			if (t->pos.state != SYN) ConntrackReInitTrack(t); // erase current entry
+			if (t->pos.state != SYN) {
+				adaptive_emit(t, "FLOW_END", "tuple_reuse");
+				ConntrackReInitTrack(t); // erase current entry
+			}
 			t->pos.client.seq0 = ntohl(dis->tcp->th_seq);
 		}
 		else if (tcp_synack_segment(dis->tcp))
 		{
 			// ignore SA dups
 			uint32_t seq0 = ntohl(dis->tcp->th_ack) - 1;
-			if (t->pos.state != SYN && t->pos.client.seq0 != seq0)
+			if (t->pos.state != SYN && t->pos.client.seq0 != seq0) {
+				adaptive_emit(t, "FLOW_END", "tuple_reuse");
 				ConntrackReInitTrack(t); // erase current entry
+			}
 			if (!t->pos.client.seq0) t->pos.client.seq0 = seq0;
 			t->pos.server.seq0 = ntohl(dis->tcp->th_seq);
 		}
@@ -217,6 +349,26 @@ static void ConntrackFeedPacket(t_ctrack *t, bool bReverse, const struct dissect
 		}
 
 		ConntrackApplyPos(t, bReverse, dis);
+	}
+	if (bReverse)
+	{
+		t->pos.server.pcounter++;
+		t->pos.server.pdcounter += !!dis->len_payload;
+		t->pos.server.pbcounter += dis->len_payload;
+		if (dis->tcp) {
+			t->server_rst |= !!(dis->tcp->th_flags & TH_RST);
+			t->server_fin |= !!(dis->tcp->th_flags & TH_FIN);
+		}
+	}
+	else
+	{
+		t->pos.client.pcounter++;
+		t->pos.client.pdcounter += !!dis->len_payload;
+		t->pos.client.pbcounter += dis->len_payload;
+		if (dis->tcp) {
+			t->client_rst |= !!(dis->tcp->th_flags & TH_RST);
+			t->client_fin |= !!(dis->tcp->th_flags & TH_FIN);
+		}
 	}
 
 	clock_gettime(CLOCK_BOOT_OR_UPTIME, &t->pos.t_last);
@@ -287,6 +439,12 @@ static bool ConntrackPoolFeedPool(t_conntrack_pool **pp, const struct dissect *d
 	return false;
 ok:
 	ctr->track.pos.ipproto = proto;
+	if (!ctr->track.flow_id) {
+		ctr->track.flow_id = ((uint64_t)(uint32_t)getpid() << 32) |
+			(adaptive_flow_seq++ & UINT32_MAX);
+		ctr->track.tuple = ctr->conn;
+		adaptive_emit(&ctr->track, "FLOW_START", "");
+	}
 	if (ctrack) *ctrack = &ctr->track;
 	if (bReverse) *bReverse = b_rev;
 	return true;
@@ -307,6 +465,7 @@ static bool ConntrackPoolDropPool(t_conntrack_pool **pp, const struct dissect *d
 		t = ConntrackPoolSearch(*pp, &connswp);
 	}
 	if (!t) return false;
+	adaptive_emit(&t->track, "FLOW_END", "drop");
 	HASH_DEL(*pp, t); ConntrackFreeElem(t);
 	return true;
 }
@@ -334,6 +493,12 @@ void ConntrackPoolPurge(t_conntrack *p)
 					) || (t->conn.l4proto == IPPROTO_UDP && tidle >= p->timeout_udp)
 				)
 			{
+				const char *reason = t->track.b_cutoff ? "cutoff" :
+					(t->track.client_rst || t->track.server_rst ? "rst_timeout" :
+					(t->conn.l4proto == IPPROTO_UDP ? "timeout_udp" :
+					(t->track.pos.state == SYN ? "timeout_syn" :
+					(t->track.pos.state == FIN ? "timeout_fin" : "timeout_established"))));
+				adaptive_emit(&t->track, "FLOW_END", reason);
 				HASH_DEL(p->pool, t); ConntrackFreeElem(t);
 			}
 		}
@@ -424,4 +589,24 @@ bool ReasmFeed(t_reassemble *reasm, uint32_t seq, const void *payload, size_t le
 bool ReasmHasSpace(t_reassemble *reasm, size_t len)
 {
 	return (reasm->size_present + len) <= reasm->size;
+}
+
+bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strategy_id, const char *scope)
+{
+	if (!track || !track->flow_id || !profile_id || !strategy_id) return false;
+	if (track->strategy_assigned) {
+		if ((track->profile_id != profile_id || track->strategy_id != strategy_id ||
+			strcmp(track->adaptive_scope, scope ? scope : "default")) && !track->strategy_conflict) {
+			track->strategy_conflict = true;
+			adaptive_emit(track, "STRATEGY_CONFLICT", "legacy_selection_changed");
+		}
+		return track->profile_id == profile_id && track->strategy_id == strategy_id;
+	}
+	track->profile_id = profile_id;
+	track->strategy_id = strategy_id;
+	snprintf(track->adaptive_scope, sizeof(track->adaptive_scope), "%s", scope ? scope : "default");
+	track->strategy_generation = adaptive_strategy_seq++;
+	track->strategy_assigned = true;
+	adaptive_emit(track, "STRATEGY_APPLIED", "");
+	return true;
 }

@@ -1080,6 +1080,18 @@ static int luacall_execution_plan(lua_State *L)
 
 	LUA_STACK_GUARD_RETURN(L,1)
 }
+static int luacall_flow_strategy_assign(lua_State *L)
+{
+	lua_check_argc(L,"flow_strategy_assign",3);
+	t_lua_desync_context *ctx = lua_desync_ctx(L);
+	lua_Integer strategy = luaL_checkinteger(L,2);
+	const char *scope = luaL_checkstring(L,3);
+	uint32_t profile = ctx->dp ? ctx->dp->n : 0;
+	if (ctx->ctrack && strategy > 0 && strategy <= UINT32_MAX)
+		(void)ConntrackSetStrategy(ctx->ctrack, profile, (uint32_t)strategy, scope);
+	return 0;
+}
+
 static int luacall_execution_plan_cancel(lua_State *L)
 {
 	lua_check_argc(L,"execution_plan_cancel",1);
@@ -4563,6 +4575,8 @@ static void lua_init_functions(void)
 		{"execution_plan",luacall_execution_plan},
 		// cancel execution of upcoming desync instances and their arguments
 		{"execution_plan_cancel",luacall_execution_plan_cancel},
+		// C-owned immutable first strategy attribution for this conntrack flow
+		{"flow_strategy_assign",luacall_flow_strategy_assign},
 		// get raw packet data
 		{"raw_packet",luacall_raw_packet},
 
