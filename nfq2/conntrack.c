@@ -44,7 +44,12 @@ static uint64_t adaptive_flow_id_next(void)
 {
 	struct timespec started;
 	uint64_t id;
-	if (adaptive_flow_seq_exhausted) return 0;
+	// on exhaustion reseed from the clock instead of starving conntrack :
+	// a rare id collision is far cheaper than flows losing tracking
+	if (adaptive_flow_seq_exhausted) {
+		adaptive_flow_seq_initialized = false;
+		adaptive_flow_seq_exhausted = false;
+	}
 	if (!adaptive_flow_seq_initialized) {
 		uint64_t seed;
 		if (clock_gettime(CLOCK_REALTIME, &started) != 0) {
