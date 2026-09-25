@@ -32,6 +32,7 @@
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <syslog.h>
 #include <grp.h>
@@ -445,6 +446,87 @@ static void notify_ready(void)
 #ifdef __linux__
 /* The control datagram is bounded, while host names use their DNS wire limit. */
 #define ADAPTIVE_CONTROL_MAX 384
+static bool adaptive_control_parent_private(const char *path)
+{
+	char parent[sizeof(((struct sockaddr_un *)0)->sun_path)];
+	char *slash;
+	struct stat st;
+	if (!path || strlen(path) >= sizeof(parent)) return false;
+	strcpy(parent, path);
+	slash = strrchr(parent, '/');
+	if (!slash) return false;
+	if (slash == parent) slash[1] = '\0'; else *slash = '\0';
+	return lstat(parent, &st) == 0 && S_ISDIR(st.st_mode) &&
+		st.st_uid == geteuid() && !(st.st_mode & 022);
+}
+
+static bool adaptive_control_same_socket(const char *path, const struct stat *expected)
+{
+	struct stat current;
+	return lstat(path, &current) == 0 && S_ISSOCK(current.st_mode) &&
+		current.st_uid == expected->st_uid && current.st_dev == expected->st_dev &&
+		current.st_ino == expected->st_ino;
+}
+
+/* 1 means active, 0 means a confirmed stale socket was removed, -1 is unsafe. */
+static int adaptive_control_existing(const char *path, const struct stat *existing)
+{
+	struct sockaddr_un local, remote;
+	struct timeval timeout = { .tv_sec = 0, .tv_usec = 300000 };
+	struct stat probe_stat;
+	char probe_path[sizeof(local.sun_path)], reply[192];
+	static const char request[] = "GET_CANDIDATE\t1\n";
+	struct timespec now;
+	int fd = -1, result = -1, stale = 0;
+	ssize_t n;
+	memset(&probe_stat, 0, sizeof(probe_stat));
+	if (!S_ISSOCK(existing->st_mode) || existing->st_uid != geteuid() ||
+		!adaptive_control_parent_private(path)) { errno = EEXIST; return -1; }
+	if (clock_gettime(CLOCK_REALTIME, &now) != 0) memset(&now, 0, sizeof(now));
+	if (snprintf(probe_path, sizeof(probe_path), "%s.probe.%ld.%ld", path,
+		(long)getpid(), now.tv_nsec) >= (int)sizeof(probe_path)) { errno = ENAMETOOLONG; return -1; }
+	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+	memset(&local, 0, sizeof(local));
+	local.sun_family = AF_UNIX;
+	strcpy(local.sun_path, probe_path);
+	if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) goto done;
+	if (lstat(probe_path, &probe_stat) != 0 || !S_ISSOCK(probe_stat.st_mode) ||
+		probe_stat.st_uid != geteuid() || chmod(probe_path, 0600) != 0) goto done;
+	memset(&remote, 0, sizeof(remote));
+	remote.sun_family = AF_UNIX;
+	if (snprintf(remote.sun_path, sizeof(remote.sun_path), "%s", path) >=
+		(int)sizeof(remote.sun_path)) { errno = ENAMETOOLONG; goto done; }
+	if (connect(fd, (struct sockaddr *)&remote, sizeof(remote)) != 0) {
+		stale = errno == ECONNREFUSED || errno == ENOENT;
+		goto stale_or_error;
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) goto done;
+	if (send(fd, request, sizeof(request)-1, 0) != (ssize_t)(sizeof(request)-1)) {
+		stale = errno == ECONNREFUSED || errno == ENOENT;
+		goto stale_or_error;
+	}
+	n = recv(fd, reply, sizeof(reply)-1, 0);
+	if (n > 0) {
+		reply[n] = '\0';
+		if (!strncmp(reply, "ACK\t1\t", 6)) result = 1;
+		else errno = EPROTO;
+		goto done;
+	}
+	/* Timeout or malformed response is ambiguous; never unlink in that case. */
+	stale = n < 0 && errno == ECONNREFUSED;
+
+stale_or_error:
+	if (stale && adaptive_control_same_socket(path, existing) && unlink(path) == 0)
+		result = 0;
+
+done:
+	if (fd >= 0) close(fd);
+	if (adaptive_control_same_socket(probe_path, &probe_stat)) (void)unlink(probe_path);
+	if (result < 0 && errno == 0) errno = EADDRINUSE;
+	return result;
+}
+
 static int adaptive_control_open(void)
 {
 	struct sockaddr_un addr;
@@ -453,14 +535,14 @@ static int adaptive_control_open(void)
 	struct stat st;
 	const char *path = params.adaptive_control_socket;
 	if (!*path) return -1;
+	if (!adaptive_control_parent_private(path)) { errno = EACCES; goto fail; }
 	if (lstat(path, &st) == 0) {
-		DLOG_ERR("adaptive control socket path already exists: %s\n", path);
-		return -1;
-	}
-	if (errno != ENOENT) {
-		DLOG_PERROR("adaptive control socket lstat");
-		return -1;
-	}
+		int active = adaptive_control_existing(path, &st);
+		if (active != 0) {
+			if (active > 0) errno = EADDRINUSE;
+			goto fail;
+		}
+	} else if (errno != ENOENT) goto fail;
 	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
 	if (fd < 0) { DLOG_PERROR("adaptive control socket"); return -1; }
 	flags = fcntl(fd, F_GETFL, 0);
