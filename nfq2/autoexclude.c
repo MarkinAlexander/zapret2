@@ -27,6 +27,11 @@
 #define AE_FAIL_RING_MAX	20	// hard cap of stored fail timestamps per host
 #define AE_HOST_LEN_MAX		255
 #define AE_CLEAN_RETENTION	86400	// keep idle history entries this long
+// minimum cumulative server payload bytes before a flow counts as a success.
+// dpi-injected fake server hellos are small and followed by garbage/rst :
+// until this threshold the flow stays undecided so later negative signals
+// remain observable (a real tls handshake delivers certs, easily above this)
+#define AE_SUCCESS_BYTES	512
 #define AE_CURL_UA		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 
 typedef struct ae_host {
@@ -570,28 +575,34 @@ static void ae_verdict_excluded(ae_host *h)
 		return;
 	}
 
-	h->n_exclusions++;
-	h->next_ttl = h->n_exclusions == 1 ?
-		(uint32_t)params.autoexclude_ttl :
-		(ttl * 2 > (uint32_t)params.autoexclude_ttl_max ? (uint32_t)params.autoexclude_ttl_max : ttl * 2);
-
-	// chronic host : repeatedly proven broken by tampering. a user visiting
-	// it every few hours must not re-win the exclusion (3+ page reloads)
-	// after every ttl expiry. permanent until the line is removed manually
-	if (params.autoexclude_sticky_after && h->n_exclusions >= (uint32_t)params.autoexclude_sticky_after)
 	{
-		h->exclude_until = 0; // forever
-		ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
-		ae_logev("%s : verdict WE_BROKE_IT : chronic (exclusion #%u) : permanent, remove the line manually to re-enable", h->host, h->n_exclusions);
-		ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=permanent exclusion=%u", h->n_exclusions);
-		ae_bus_emit(h->host, "AE_CHRONIC", "exclusion=%u", h->n_exclusions);
-		return;
-	}
+		bool bweak = h->probe_weak;
+		h->n_exclusions++;
+		if (!bweak) h->n_strong++;
+		h->probe_weak = false;
+		h->next_ttl = h->n_exclusions == 1 ?
+			(uint32_t)params.autoexclude_ttl :
+			(ttl * 2 > (uint32_t)params.autoexclude_ttl_max ? (uint32_t)params.autoexclude_ttl_max : ttl * 2);
 
-	h->exclude_until = time(NULL) + ttl;
-	ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
-	ae_logev("%s : verdict WE_BROKE_IT : excluded for %u s (exclusion #%u)", h->host, ttl, h->n_exclusions);
-	ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=%u exclusion=%u", ttl, h->n_exclusions);
+		// chronic host : repeatedly proven broken by tampering with STRONG evidence.
+		// a user visiting it every few hours must not re-win the exclusion (3+ page
+		// reloads) after every ttl expiry. permanent until the line is removed manually
+		if (params.autoexclude_sticky_after && h->n_strong >= (uint32_t)params.autoexclude_sticky_after)
+		{
+			h->exclude_until = 0; // forever
+			ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+			ae_logev("%s : verdict WE_BROKE_IT : chronic (exclusion #%u, strong %u) : permanent, remove the line manually to re-enable",
+				h->host, h->n_exclusions, h->n_strong);
+			ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=permanent exclusion=%u proof=strong", h->n_exclusions);
+			ae_bus_emit(h->host, "AE_CHRONIC", "exclusion=%u strong=%u", h->n_exclusions, h->n_strong);
+			return;
+		}
+
+		h->exclude_until = time(NULL) + ttl;
+		ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+		ae_logev("%s : verdict WE_BROKE_IT : excluded for %u s (exclusion #%u%s)", h->host, ttl, h->n_exclusions, bweak ? ", weak proof" : "");
+		ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=%u exclusion=%u proof=%s", ttl, h->n_exclusions, bweak ? "weak" : "strong");
+	}
 }
 
 static void ae_verdict_notcand(ae_host *h, const char *reason)
@@ -900,8 +911,12 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 				return;
 			}
 		}
-		// any real server data (not RST, not garbage) means the flow works
-		if (dis->len_payload && !bRST)
+		// real server data (not RST, not garbage) means the flow works. require
+		// a meaningful cumulative amount : dpi-injected fake server hellos are
+		// small, and until this threshold the flow stays undecided so later
+		// garbage/rst signals remain observable
+		if (dis->len_payload && !bRST &&
+		    ctrack->pos.server.pbcounter + dis->len_payload >= AE_SUCCESS_BYTES)
 		{
 			if (ctrack->ae_attacked && !ctrack->ae_finalized)
 			{
@@ -915,14 +930,17 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 	}
 	else if (dis->proto == IPPROTO_UDP && dis->len_payload)
 	{
-		if (ctrack->ae_attacked && !ctrack->ae_finalized)
+		if (ctrack->pos.server.pbcounter + dis->len_payload >= AE_SUCCESS_BYTES)
 		{
-			ctrack->ae_finalized = true;
-			ae_ok_note(ctrack->hostname, ae_l7_idx(ctrack->l7proto));
-			ae_flow_succeeded(ctrack->hostname);
+			if (ctrack->ae_attacked && !ctrack->ae_finalized)
+			{
+				ctrack->ae_finalized = true;
+				ae_ok_note(ctrack->hostname, ae_l7_idx(ctrack->l7proto));
+				ae_flow_succeeded(ctrack->hostname);
+			}
+			else
+				ae_probe_success(ctrack->hostname);
 		}
-		else
-			ae_probe_success(ctrack->hostname);
 	}
 }
 
@@ -1260,9 +1278,9 @@ static void ae_save_state(void)
 	HASH_ITER(hh, ae_hosts, h, tmp)
 	{
 		if (h->state == AE_ST_CLEAN && !h->n_exclusions && !h->force_attack) continue;
-		w = snprintf(buf + used, size - used, "%s\t%u\t%u\t%lld\t%u\t%u\t%u\n",
+		w = snprintf(buf + used, size - used, "%s\t%u\t%u\t%lld\t%u\t%u\t%u\t%u\n",
 			h->host, h->force_attack ? 5 : h->state, h->n_exclusions, (long long)h->exclude_until, h->next_ttl,
-			h->l7_seen_tls ? 1 : 0, h->l7_seen_http ? 1 : 0);
+			h->l7_seen_tls ? 1 : 0, h->l7_seen_http ? 1 : 0, h->n_strong);
 		if (w < 0 || (size_t)w >= size - used) break;
 		used += (size_t)w;
 	}
@@ -1353,13 +1371,17 @@ static void ae_state_line_cb(const char *line, void *ctx)
 {
 	struct ae_load_ctx *c = (struct ae_load_ctx*)ctx;
 	char host[AE_HOST_LEN_MAX + 1];
-	unsigned state, nexcl, next_ttl, tls, http;
+	unsigned state, nexcl, next_ttl, tls, http, nstrong = 0;
 	long long until;
 	ae_host *h;
-	bool bforce_attack;
+	int nf;
 
-	if (sscanf(line, "%255s %u %u %lld %u %u %u", host, &state, &nexcl, &until, &next_ttl, &tls, &http) < 5) return;
-	bforce_attack = state == 5;
+	nf = sscanf(line, "%255s %u %u %lld %u %u %u %u", host, &state, &nexcl, &until, &next_ttl, &tls, &http, &nstrong);
+	if (nf < 5) return;
+	// legacy state without the strong column : assume all past exclusions
+	// were strongly proven, so upgrading does not demote existing chronics
+	if (nf < 8) nstrong = nexcl;
+	bool bforce_attack = state == 5;
 	if (bforce_attack)
 	{
 		// force_attack override : clean + not tracked, shadows a pass-only parent
@@ -1376,6 +1398,7 @@ static void ae_state_line_cb(const char *line, void *ctx)
 	h->next_ttl = next_ttl;
 	h->l7_seen_tls = !!tls;
 	h->l7_seen_http = !!http;
+	h->n_strong = nstrong;
 	h->force_attack = bforce_attack || h->force_attack;
 	h->t_last_activity = c->now;
 	c->bHaveState = true;
@@ -2117,6 +2140,10 @@ static void ae_scan_conntrack(time_t nowboot)
 		t_ctrack *t = &cp->track;
 		if (!t->ae_attacked || t->ae_finalized || !t->hostname || t->hostname_is_ip) continue;
 		if (cp->conn.l4proto != IPPROTO_TCP) continue;
+		// the client must have actually sent payload in this flow : abandoned
+		// preconnects with a cache-backfilled hostname are not server failures,
+		// the server has nothing to answer
+		if (!t->pos.client.pbcounter) continue;
 		// only the SYNACK counts as a "server packet" here : compare sequence
 		// positions, not packet counters. no advance means no data, no FIN,
 		// no RST was ever seen from the server
