@@ -63,7 +63,7 @@ typedef struct
 	uint32_t profile_id, strategy_id;
 	uint32_t candidate_profile_id, candidate_strategy_id;
 	char adaptive_scope[64];
-	bool strategy_assigned, strategy_conflict;
+	bool strategy_assigned, strategy_conflict, adaptive_terminal_emitted;
 	bool client_rst, server_rst, client_fin, server_fin;
 	bool clienthello_seq_seen;
 	uint32_t clienthello_first_seq;

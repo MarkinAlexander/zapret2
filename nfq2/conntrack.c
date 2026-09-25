@@ -182,20 +182,21 @@ static bool adaptive_send_unix(const char *path, const char *line, size_t len)
 }
 #endif
 
-static void adaptive_write_line(const char *line, size_t n)
+static bool adaptive_write_line(const char *line, size_t n)
 {
 	int fd;
 	struct stat st;
-	if (n<=0) return;
+	if (n<=0) return false;
 	if (!strncmp(params.adaptive_events_file, "unix:", 5)) {
 #ifdef __linux__
-		(void)adaptive_send_unix(params.adaptive_events_file + 5, line, n);
+		return adaptive_send_unix(params.adaptive_events_file + 5, line, n);
+#else
+		return false;
 #endif
-		return;
 	}
 	fd=adaptive_event_file_fd;
 	if (fd<0 || adaptive_trace_limited || fstat(fd, &st)<0 || st.st_size<0) {
-		return;
+		return false;
 	}
 	/* Reserve room for an explicit truncation marker; never grow /tmp without bound. */
 	if ((uint64_t)st.st_size + (uint64_t)n >
@@ -205,12 +206,13 @@ static void adaptive_write_line(const char *line, size_t n)
 			if (written != (ssize_t)(sizeof(adaptive_trace_limit_marker)-1)) adaptive_trace_limited = true;
 		}
 		adaptive_trace_limited = true;
-		return;
+		return false;
 	}
 	{
 		ssize_t written = write(fd, line, n);
-		if (written != (ssize_t)n) adaptive_trace_limited = true;
+		if (written != (ssize_t)n) { adaptive_trace_limited = true; return false; }
 	}
+	return true;
 }
 
 static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
@@ -220,6 +222,7 @@ static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
 	int n;
 	struct timespec wall;
 	if (!params.adaptive_events_file[0] || !t || !t->flow_id) return;
+	if (!strcmp(event, "FLOW_END") && t->adaptive_terminal_emitted) return;
 	/* Keep file traces complete, but do not let unassigned conntrack entries
 	 * consume the live controller's bounded open-flow table. */
 	if (!strncmp(params.adaptive_events_file, "unix:", 5) && !t->strategy_assigned) return;
@@ -245,7 +248,8 @@ static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
 		(unsigned long long)t->adaptive_injected_bytes,
 		reason ? reason : "");
 	if (n<=0 || (size_t)n>=sizeof(line)) return;
-	adaptive_write_line(line, (size_t)n);
+	if (adaptive_write_line(line, (size_t)n) && !strcmp(event, "FLOW_END"))
+		t->adaptive_terminal_emitted = true;
 }
 
 // host-scoped event (autoexclude engine). same column layout as flow events,
@@ -268,7 +272,7 @@ void adaptive_emit_host(const char *event, const char *host, const char *payload
 		"v2\t%llu\t%s\t0\t%u\t%u\t0\tae\t%s\t\t\t\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t%llu\t%llu\t0\t0\t%s\n",
 		now_ms, event, profile_id, strategy_id, hostbuf, now_ms, now_ms, paybuf);
 	if (n<=0 || (size_t)n>=sizeof(line)) return;
-	adaptive_write_line(line, (size_t)n);
+	(void)adaptive_write_line(line, (size_t)n);
 }
 
 void ConntrackAdaptiveRecordInjection(t_ctrack *track, uint64_t packets, uint64_t bytes)
@@ -534,6 +538,10 @@ static void ConntrackFeedPacket(t_ctrack *t, bool bReverse, const struct dissect
 	clock_gettime(CLOCK_BOOT_OR_UPTIME, &t->pos.t_last);
 	// make sure t_start gets exactly the same value as first t_last
 	if (!t->t_start.tv_sec) t->t_start = t->pos.t_last;
+	if (t->client_rst || t->server_rst)
+		adaptive_emit(t, "FLOW_END", "rst");
+	else if (t->client_fin && t->server_fin)
+		adaptive_emit(t, "FLOW_END", "fin");
 }
 
 static bool ConntrackPoolDoubleSearchPool(t_conntrack_pool **pp, const struct dissect *dis, t_ctrack **ctrack, bool *bReverse)
