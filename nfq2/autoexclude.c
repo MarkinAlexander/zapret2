@@ -50,7 +50,6 @@ typedef struct ae_host {
 	uint8_t probe_attempts;	// active probe retry counter within current phase
 	uint8_t po_attempts;	// pass-only client attempts observed in this probe
 	uint8_t po_rst;		// early RSTs seen on pass-only attempts (provider block)
-	uint8_t po_live;	// pass-only attempts that received any server payload (direct path alive)
 	bool l7_seen_tls, l7_seen_http; // protocols seen on attributed flows. picks the probe scheme
 	time_t ok_times[3][4];	// recent attack-success timestamps per l7 (0=tls,1=http,2=other)
 	uint8_t ok_head[3];
@@ -60,7 +59,7 @@ typedef struct ae_host {
 					// only strong proofs advance toward chronic : weak-B1 verdicts (stalls
 					// without an RST, provider drop-blocks look the same) must not lock a
 					// host out of its bypass forever
-	bool probe_weak;		// current probe cycle entered reattack via weak B1
+	bool probe_weak;		// legacy: kept false, strong-only differential since ct11
 	uint32_t last_fail_profile, last_fail_strategy; // strategy attribution of the most recent failed flow (0 = none)
 	uint32_t strategy_fail_count; // fails attributed to last_fail_strategy since it was set
 	bool adopted;		// external controller owns this host : engine ignores it
@@ -127,7 +126,6 @@ static time_t ae_last_mirror;
 
 static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, const t_ctrack *ctrack);
 static void ae_flow_succeeded(const char *hostname);
-static void ae_probe_liveness(const char *hostname);
 static void ae_probe_success(const char *hostname);
 static ae_host * ae_find(const char *hostname);
 static bool ae_adopted_match(const char *hostname);
@@ -733,32 +731,17 @@ static void ae_child_dispatch(bool bok, bool binconclusive)
 			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=ok");
 			h->probe_weak = false; // the probe itself opened the site : strong proof
 		}
-		else if (h->po_attempts && !h->po_rst && h->po_live)
-		{
-			// all active probes stalled, but client pass-only attempts were
-			// observed, none got an RST and at least one saw server payload :
-			// weak B1, let the re-attack decide
-			h->deadline = time(NULL) + params.autoexclude_reattack_window;
-			ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
-			ae_logev("%s : weak B1 : probes stalled, %u pass-only attempt(s) without an RST, re-attacking for %d s",
-				h->host, h->po_attempts, params.autoexclude_reattack_window);
-			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=weak po_attempts=%u po_live=%u", h->po_attempts, h->po_live);
-			h->probe_weak = true; // stalls without an RST : a provider drop-block looks the same
-		}
-		else if (h->po_attempts && !h->po_rst)
-		{
-			// pass-only attempts stalled with zero server payload and all
-			// active probes failed : the direct path is silent, this is how a
-			// drop-block (rkn-style dpi) looks. nothing proves clean traffic
-			// works, so "we broke it" is unproven : not our fault, keep the
-			// host under tampering
-			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=fail reason=no_direct_liveness po_attempts=%u", h->po_attempts);
-			ae_verdict_notcand(h, "direct access silent without tampering (drop-block?), not our fault");
-		}
 		else
 		{
-			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=fail");
-			ae_verdict_notcand(h, "probe failed without tampering");
+			// strict differential : an exclusion needs positive proof that
+			// the site works without tampering (an answered http probe or a
+			// pass-only flow with real server data). stalls without an RST
+			// prove nothing either way -- a drop-blocked host and a stalling
+			// but alive one look identical, and dpi-injected fake bytes must
+			// not speak for the direct path. without proof, "we broke it" is
+			// unproven : not our fault, keep the host under tampering
+			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=fail po_attempts=%u po_rst=%u", h->po_attempts, h->po_rst);
+			ae_verdict_notcand(h, "direct access not proven without tampering (drop-block or stall?), not our fault");
 		}
 	}
 	else if (phase == AE_PH_CURL_B2)
@@ -1010,11 +993,6 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 				return;
 			}
 		}
-		// pass-only flow received any server payload : the direct path is
-		// alive. this is the liveness signal the weak B1 decision needs to
-		// tell a stalling-but-working host from a drop-blocked one
-		if (!ctrack->ae_attacked && dis->len_payload && !bRST)
-			ae_probe_liveness(ctrack->hostname);
 		// real server data (not RST, not garbage) means the flow works. require
 		// a meaningful cumulative amount : dpi-injected fake server hellos are
 		// small, and until this threshold the flow stays undecided so later
@@ -1034,8 +1012,6 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 	}
 		else if (dis->proto == IPPROTO_UDP && dis->len_payload)
 		{
-			if (!ctrack->ae_attacked)
-				ae_probe_liveness(ctrack->hostname);
 			if (ctrack->pos.server.pbcounter + dis->len_payload >= AE_SUCCESS_BYTES)
 		{
 			if (ctrack->ae_attacked && !ctrack->ae_finalized)
@@ -1054,7 +1030,7 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 
 // outgoing data of a pass-only flow. counted once per flow. stalled clean
 // connections (cdn lottery : data on the wire, nothing userspace-visible)
-// still prove the absence of an early RST, which is the weak B1 signal
+// still prove the absence of an early RST (observability only since ct11)
 void ae_passonly_attempt(t_ctrack *ctrack)
 {
 	ae_host *h;
@@ -1190,7 +1166,6 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, 
 			ae_bus_emit(h->host, "AE_SUSPECT", "signal=%s l7=%s window=%d", reason, ae_l7_str(l7idx), params.autoexclude_fail_window);
 			h->po_attempts = 0;
 			h->po_rst = 0;
-			h->po_live = 0;
 			h->probe_weak = false;
 		}
 		break;
@@ -1277,20 +1252,6 @@ static void ae_flow_succeeded(const char *hostname)
 		ae_bus_emit(h->host, "AE_SUCCESS", "context=reattack l7=%s", ae_l7_str(h->last_fail_l7));
 		ae_verdict_transient(h, "client success under re-attack");
 	}
-}
-
-// any server payload on a pass-only flow proves the direct path is alive
-// even below the success threshold. a drop-blocked host (rkn-style dpi
-// silence) never shows a single byte : stalls alone must not speak for it
-static void ae_probe_liveness(const char *hostname)
-{
-	ae_host *h;
-
-	if (!params.ae_inited) return;
-	h = ae_find(hostname);
-	if (!h) return;
-	if (h->state == AE_ST_PROBE && (h->phase == AE_PH_PASSIVE_WAIT || h->phase == AE_PH_CURL_B1))
-		h->po_live = 1;
 }
 
 static void ae_probe_success(const char *hostname)
@@ -2460,22 +2421,6 @@ void ae_timer(void)
 			case AE_PH_PASSIVE_WAIT:
 				if (now >= h->deadline)
 				{
-				// weak B1 : pass-only client attempts were observed and none
-				// of them got an early RST. the site does not reject clean
-				// traffic (stalled attempts are the cdn lottery), so proceed
-				// to the re-attack and let B2 decide. requires at least one
-				// attempt with server payload : pure silence is a drop-block,
-				// and active probes get the final say there
-				if (h->po_attempts && !h->po_rst && h->po_live)
-				{
-					h->deadline = now + params.autoexclude_reattack_window;
-					ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
-					ae_logev("%s : weak B1 : %u pass-only attempt(s) without an RST, re-attacking for %d s",
-						h->host, h->po_attempts, params.autoexclude_reattack_window);
-					ae_bus_emit(h->host, "AE_PROBE_B1", "source=client result=weak po_attempts=%u po_live=%u", h->po_attempts, h->po_live);
-					h->probe_weak = true;
-					break;
-				}
 #ifdef AE_CAN_FORK
 					if (!params.autoexclude_passive && ae_probe_spawn(h, AE_PH_CURL_B1))
 						ae_set_state(h, AE_ST_PROBE, AE_PH_CURL_B1);
