@@ -127,6 +127,8 @@ void ConntrackPoolDump(const t_conntrack *p);
 void ConntrackPoolPurge(t_conntrack *p);
 void ConntrackClearHostname(t_ctrack *track);
 bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strategy_id, const char *scope);
+// host-scoped telemetry event on the adaptive bus (autoexclude engine)
+void adaptive_emit_host(const char *event, const char *host, const char *payload, uint32_t profile_id, uint32_t strategy_id);
 
 bool ReasmInit(t_reassemble *reasm, size_t size_requested, uint32_t seq_start);
 bool ReasmResize(t_reassemble *reasm, size_t new_size);

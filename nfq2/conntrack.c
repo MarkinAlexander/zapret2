@@ -69,10 +69,44 @@ static bool adaptive_send_unix(const char *path, const char *line, size_t len)
 }
 #endif
 
-static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
+static void adaptive_write_line(const char *line, size_t n)
 {
 	int fd;
 	struct stat st;
+	if (n<=0) return;
+	if (!strncmp(params.adaptive_events_file, "unix:", 5)) {
+#ifdef __linux__
+		(void)adaptive_send_unix(params.adaptive_events_file + 5, line, n);
+#endif
+		return;
+	}
+	fd=open(params.adaptive_events_file, O_WRONLY|O_CREAT|O_APPEND, 0600);
+	if (fd<0) return;
+	(void)fchmod(fd, 0600);
+	if (adaptive_trace_limited || fstat(fd, &st)<0 || st.st_size<0) {
+		close(fd);
+		return;
+	}
+	/* Reserve room for an explicit truncation marker; never grow /tmp without bound. */
+	if ((uint64_t)st.st_size + (uint64_t)n >
+		ADAPTIVE_EVENTS_MAX_BYTES - (sizeof(adaptive_trace_limit_marker)-1)) {
+		if ((uint64_t)st.st_size + sizeof(adaptive_trace_limit_marker)-1 <= ADAPTIVE_EVENTS_MAX_BYTES) {
+			ssize_t written = write(fd, adaptive_trace_limit_marker, sizeof(adaptive_trace_limit_marker)-1);
+			if (written != (ssize_t)(sizeof(adaptive_trace_limit_marker)-1)) adaptive_trace_limited = true;
+		}
+		adaptive_trace_limited = true;
+		close(fd);
+		return;
+	}
+	{
+		ssize_t written = write(fd, line, n);
+		if (written != (ssize_t)n) adaptive_trace_limited = true;
+	}
+	close(fd);
+}
+
+static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
+{
 	char scope[64], host[256], dst[INET6_ADDRSTRLEN], line[1200];
 	char *h;
 	int n;
@@ -98,35 +132,30 @@ static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
 		(unsigned)t->clienthello_count, (unsigned)t->clienthello_retransmissions,
 		reason ? reason : "");
 	if (n<=0 || (size_t)n>=sizeof(line)) return;
-	if (!strncmp(params.adaptive_events_file, "unix:", 5)) {
-#ifdef __linux__
-		(void)adaptive_send_unix(params.adaptive_events_file + 5, line, (size_t)n);
-#endif
-		return;
-	}
-	fd=open(params.adaptive_events_file, O_WRONLY|O_CREAT|O_APPEND, 0600);
-	if (fd<0) return;
-	(void)fchmod(fd, 0600);
-	if (adaptive_trace_limited || fstat(fd, &st)<0 || st.st_size<0) {
-		close(fd);
-		return;
-	}
-	/* Reserve room for an explicit truncation marker; never grow /tmp without bound. */
-	if ((uint64_t)st.st_size + (uint64_t)n >
-		ADAPTIVE_EVENTS_MAX_BYTES - (sizeof(adaptive_trace_limit_marker)-1)) {
-		if ((uint64_t)st.st_size + sizeof(adaptive_trace_limit_marker)-1 <= ADAPTIVE_EVENTS_MAX_BYTES) {
-			ssize_t written = write(fd, adaptive_trace_limit_marker, sizeof(adaptive_trace_limit_marker)-1);
-			if (written != (ssize_t)(sizeof(adaptive_trace_limit_marker)-1)) adaptive_trace_limited = true;
-		}
-		adaptive_trace_limited = true;
-		close(fd);
-		return;
-	}
-	{
-		ssize_t written = write(fd, line, (size_t)n);
-		if (written != n) adaptive_trace_limited = true;
-	}
-	close(fd);
+	adaptive_write_line(line, (size_t)n);
+}
+
+// host-scoped event (autoexclude engine). same column layout as flow events,
+// flow-specific columns are zeroed/empty, flow_id=0, scope="ae"
+void adaptive_emit_host(const char *event, const char *host, const char *payload, uint32_t profile_id, uint32_t strategy_id)
+{
+	char hostbuf[256], paybuf[256], line[900];
+	char *h;
+	int n;
+	struct timespec wall;
+	unsigned long long now_ms;
+	if (!params.adaptive_events_file[0] || !event || !host) return;
+	snprintf(hostbuf, sizeof(hostbuf), "%s", host);
+	for (h=hostbuf; *h; h++) if (*h=='\t' || *h=='\r' || *h=='\n') *h='_';
+	snprintf(paybuf, sizeof(paybuf), "%s", payload ? payload : "");
+	for (h=paybuf; *h; h++) if (*h=='\t' || *h=='\r' || *h=='\n') *h='_';
+	clock_gettime(CLOCK_REALTIME, &wall);
+	now_ms = (unsigned long long)wall.tv_sec*1000 + wall.tv_nsec/1000000;
+	n = snprintf(line, sizeof(line),
+		"v2\t%llu\t%s\t0\t%u\t%u\t0\tae\t%s\t\t\t\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t%llu\t%llu\t0\t0\t%s\n",
+		now_ms, event, profile_id, strategy_id, hostbuf, now_ms, now_ms, paybuf);
+	if (n<=0 || (size_t)n>=sizeof(line)) return;
+	adaptive_write_line(line, (size_t)n);
 }
 
 

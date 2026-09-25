@@ -1,6 +1,7 @@
 #include "autoexclude.h"
 #include "params.h"
 #include "helpers.h"
+#include "conntrack.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,16 @@ typedef struct ae_host {
 	uint8_t ok_head[3];
 	uint8_t ok_count[3];
 	uint8_t last_fail_l7;	// l7 of the most recent failed flow
+	uint32_t n_strong;		// exclusions proven with strong B1 evidence (real client/curl success).
+					// only strong proofs advance toward chronic : weak-B1 verdicts (stalls
+					// without an RST, provider drop-blocks look the same) must not lock a
+					// host out of its bypass forever
+	bool probe_weak;		// current probe cycle entered reattack via weak B1
+	uint32_t last_fail_profile, last_fail_strategy; // strategy attribution of the most recent failed flow (0 = none)
+	uint32_t strategy_fail_count; // fails attributed to last_fail_strategy since it was set
+	bool adopted;		// external controller owns this host : engine ignores it
+	bool force_attack;	// owner override : this exact host must stay attacked even
+				// when a parent domain is pass-only. persisted in the state file
 	UT_hash_handle hh;
 } ae_host;
 
@@ -59,6 +70,11 @@ typedef struct ae_host {
 static int ae_l7_idx(t_l7proto p)
 {
 	return p == L7_TLS ? AE_L7_TLS : p == L7_HTTP ? AE_L7_HTTP : AE_L7_OTHER;
+}
+
+static const char * ae_l7_str(int idx)
+{
+	return idx == AE_L7_TLS ? "tls" : idx == AE_L7_HTTP ? "http" : "other";
 }
 
 // how many attack successes within the veto window qualify a host as
@@ -98,9 +114,10 @@ static time_t ae_list_last_check;
 static file_mod_sig ae_mirror_sig_list, ae_mirror_sig_state;
 static time_t ae_last_mirror;
 
-static void ae_flow_failed(const char *hostname, const char *reason, int l7idx);
+static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, const t_ctrack *ctrack);
 static void ae_flow_succeeded(const char *hostname);
 static void ae_probe_success(const char *hostname);
+static ae_host * ae_find(const char *hostname);
 
 #ifdef AE_CAN_FORK
 static struct {
@@ -142,6 +159,24 @@ static void ae_logev(const char *fmt, ...)
 			fclose(F);
 		}
 	}
+}
+
+// host-scoped AE_* event on the adaptive telemetry bus. no-op when the bus is
+// off : the human log above stays the only channel (current behaviour).
+// strategy attribution comes from the tracked host when it exists
+static void ae_bus_emit(const char *host, const char *event, const char *fmt, ...)
+{
+	char payload[256];
+	va_list ap;
+	ae_host *h;
+
+	if (!host || !*params.adaptive_events_file) return;
+	va_start(ap, fmt);
+	vsnprintf(payload, sizeof(payload), fmt, ap);
+	va_end(ap);
+	h = ae_find(host);
+	adaptive_emit_host(event, host, payload,
+		h ? h->last_fail_profile : 0, h ? h->last_fail_strategy : 0);
 }
 
 static void ae_lowercase(char *s)
@@ -511,6 +546,7 @@ static void ae_verdict_excluded(ae_host *h)
 	if (ae_veto(h))
 	{
 		ae_logev("%s : veto : works under tampering, zapret is helping this host. not excluding", h->host);
+		ae_bus_emit(h->host, "AE_VETO", "at=verdict l7=%s", ae_l7_str(h->last_fail_l7));
 		h->fail_count = 0;
 		h->fail_head = 0;
 		ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
@@ -530,12 +566,15 @@ static void ae_verdict_excluded(ae_host *h)
 		h->exclude_until = 0; // forever
 		ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
 		ae_logev("%s : verdict WE_BROKE_IT : chronic (exclusion #%u) : permanent, remove the line manually to re-enable", h->host, h->n_exclusions);
+		ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=permanent exclusion=%u", h->n_exclusions);
+		ae_bus_emit(h->host, "AE_CHRONIC", "exclusion=%u", h->n_exclusions);
 		return;
 	}
 
 	h->exclude_until = time(NULL) + ttl;
 	ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
 	ae_logev("%s : verdict WE_BROKE_IT : excluded for %u s (exclusion #%u)", h->host, ttl, h->n_exclusions);
+	ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=%u exclusion=%u", ttl, h->n_exclusions);
 }
 
 static void ae_verdict_notcand(ae_host *h, const char *reason)
@@ -543,6 +582,7 @@ static void ae_verdict_notcand(ae_host *h, const char *reason)
 	h->deadline = time(NULL) + params.autoexclude_cooldown;
 	ae_set_state(h, AE_ST_NOTCAND, AE_PH_NONE);
 	ae_logev("%s : verdict NOT_CANDIDATE (%s) : not excluded, cooldown %d s", h->host, reason, params.autoexclude_cooldown);
+	ae_bus_emit(h->host, "AE_VERDICT", "verdict=NOT_CANDIDATE reason=%s cooldown=%d", reason, params.autoexclude_cooldown);
 }
 
 static void ae_verdict_transient(ae_host *h, const char *reason)
@@ -552,6 +592,7 @@ static void ae_verdict_transient(ae_host *h, const char *reason)
 	h->fail_head = 0;
 	ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
 	ae_logev("%s : verdict OK_TRANSIENT (%s) : returned to processing", h->host, reason);
+	ae_bus_emit(h->host, "AE_VERDICT", "verdict=OK_TRANSIENT reason=%s", reason);
 }
 
 #ifdef AE_CAN_FORK
@@ -567,6 +608,7 @@ static void ae_child_dispatch(bool bok, bool binconclusive)
 	if (binconclusive)
 	{
 		ae_logev("%s : probe inconclusive (curl could not run) : returned to processing", h->host);
+		ae_bus_emit(h->host, "AE_VERDICT", "verdict=INCONCLUSIVE reason=curl_unavailable");
 		h->fail_count = 0;
 		h->fail_head = 0;
 		h->probe_attempts = 0;
@@ -592,6 +634,8 @@ static void ae_child_dispatch(bool bok, bool binconclusive)
 			h->deadline = time(NULL) + params.autoexclude_reattack_window;
 			ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
 			ae_logev("%s : probe B1 ok (works without tampering), re-attacking for %d s", h->host, params.autoexclude_reattack_window);
+			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=ok");
+			h->probe_weak = false; // the probe itself opened the site : strong proof
 		}
 		else if (h->po_attempts && !h->po_rst)
 		{
@@ -601,9 +645,14 @@ static void ae_child_dispatch(bool bok, bool binconclusive)
 			ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
 			ae_logev("%s : weak B1 : probes stalled, %u pass-only attempt(s) without an RST, re-attacking for %d s",
 				h->host, h->po_attempts, params.autoexclude_reattack_window);
+			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=weak po_attempts=%u", h->po_attempts);
+			h->probe_weak = true; // stalls without an RST : a provider drop-block looks the same
 		}
 		else
+		{
+			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=fail");
 			ae_verdict_notcand(h, "probe failed without tampering");
+		}
 	}
 	else if (phase == AE_PH_CURL_B2)
 	{
@@ -612,6 +661,7 @@ static void ae_child_dispatch(bool bok, bool binconclusive)
 		if (bok)
 		{
 			h->probe_attempts = 0;
+			ae_bus_emit(h->host, "AE_PROBE_B2", "source=curl result=ok");
 			ae_verdict_transient(h, "probe B2 ok");
 		}
 		else if (++h->probe_attempts < 2)
@@ -622,11 +672,13 @@ static void ae_child_dispatch(bool bok, bool binconclusive)
 				return;
 			}
 			h->probe_attempts = 0;
+			ae_bus_emit(h->host, "AE_PROBE_B2", "source=curl result=fail");
 			ae_verdict_excluded(h);
 		}
 		else
 		{
 			h->probe_attempts = 0;
+			ae_bus_emit(h->host, "AE_PROBE_B2", "source=curl result=fail");
 			ae_verdict_excluded(h);
 		}
 	}
@@ -710,7 +762,7 @@ void ae_hook_retrans(t_ctrack *ctrack, const struct dissect *dis)
 	if (++ctrack->ae_retrans >= params.autoexclude_retrans_threshold)
 	{
 		ctrack->ae_finalized = true;
-		ae_flow_failed(ctrack->hostname, "retrans", ae_l7_idx(ctrack->l7proto));
+		ae_flow_failed(ctrack->hostname, "retrans", ae_l7_idx(ctrack->l7proto), ctrack);
 	}
 }
 
@@ -728,7 +780,7 @@ void ae_hook_udp(t_ctrack *ctrack, const t_ctrack_positions *tpos)
 	else if (tpos->client.pcounter >= params.autoexclude_udp_out)
 	{
 		ctrack->ae_finalized = true;
-		ae_flow_failed(ctrack->hostname, "udp", ae_l7_idx(ctrack->l7proto));
+		ae_flow_failed(ctrack->hostname, "udp", ae_l7_idx(ctrack->l7proto), ctrack);
 	}
 }
 
@@ -792,7 +844,7 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 			if (bRST)
 			{
 				ctrack->ae_finalized = true;
-				ae_flow_failed(ctrack->hostname, "rst", ae_l7_idx(ctrack->l7proto));
+				ae_flow_failed(ctrack->hostname, "rst", ae_l7_idx(ctrack->l7proto), ctrack);
 				return;
 			}
 			if (dis->tcp->th_flags & TH_FIN)
@@ -802,21 +854,21 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 				// a bare FIN (no reply, no RST). a normal small exchange has
 				// already finalized this flow on its data packets
 				ctrack->ae_finalized = true;
-				ae_flow_failed(ctrack->hostname, "fin", ae_l7_idx(ctrack->l7proto));
+				ae_flow_failed(ctrack->hostname, "fin", ae_l7_idx(ctrack->l7proto), ctrack);
 				return;
 			}
 			if (dis->len_payload && ctrack->l7proto == L7_TLS &&
 			    !ae_tls_first_record_ok(dis->data_payload, dis->len_payload))
 			{
 				ctrack->ae_finalized = true;
-				ae_flow_failed(ctrack->hostname, "garbage", ae_l7_idx(ctrack->l7proto));
+				ae_flow_failed(ctrack->hostname, "garbage", ae_l7_idx(ctrack->l7proto), ctrack);
 				return;
 			}
 			if (dis->len_payload && ctrack->l7proto == L7_HTTP &&
 			    !ae_http_reply_ok(dis->data_payload, dis->len_payload))
 			{
 				ctrack->ae_finalized = true;
-				ae_flow_failed(ctrack->hostname, "garbage", ae_l7_idx(ctrack->l7proto));
+				ae_flow_failed(ctrack->hostname, "garbage", ae_l7_idx(ctrack->l7proto), ctrack);
 				return;
 			}
 		}
@@ -904,7 +956,7 @@ void ae_passonly_rst(const char *hostname)
 	}
 }
 
-static void ae_flow_failed(const char *hostname, const char *reason, int l7idx)
+static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, const t_ctrack *ctrack)
 {
 	ae_host *h;
 	time_t now = time(NULL);
@@ -944,6 +996,18 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx)
 	}
 	h->t_last_activity = now;
 	if (l7idx >= AE_L7_TLS && l7idx <= AE_L7_OTHER) h->last_fail_l7 = (uint8_t)l7idx;
+	// remember which strategy was attacking the failing flow : the controller
+	// uses this attribution to rotate strategies instead of excluding hosts
+	if (ctrack && ctrack->strategy_assigned)
+	{
+		if (h->last_fail_profile != ctrack->profile_id || h->last_fail_strategy != ctrack->strategy_id)
+		{
+			h->last_fail_profile = ctrack->profile_id;
+			h->last_fail_strategy = ctrack->strategy_id;
+			h->strategy_fail_count = 0;
+		}
+		h->strategy_fail_count++;
+	}
 
 	switch (h->state)
 	{
@@ -953,6 +1017,8 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx)
 		h->fail_head = (h->fail_head + 1) % AE_FAIL_RING_MAX;
 		if (h->fail_count < AE_FAIL_RING_MAX) h->fail_count++;
 		ae_logev("%s : failed flow (%s) : %u/%u in %d s", h->host, reason, h->fail_count, ae_fail_threshold(h), params.autoexclude_fail_window);
+		ae_bus_emit(h->host, "AE_FAIL", "signal=%s l7=%s count=%u threshold=%u",
+			reason, ae_l7_str(l7idx), h->fail_count, ae_fail_threshold(h));
 		if (h->fail_count >= ae_fail_threshold(h))
 		{
 			// veto : this host works under tampering, zapret serves it.
@@ -961,6 +1027,7 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx)
 			if (ae_veto(h))
 			{
 				ae_logev("%s : threshold reached but host works under tampering, zapret is helping it. not probing", h->host);
+				ae_bus_emit(h->host, "AE_VETO", "at=threshold l7=%s", ae_l7_str(l7idx));
 				h->fail_count = 0;
 				h->fail_head = 0;
 				break;
@@ -968,8 +1035,10 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx)
 			h->deadline = now + params.autoexclude_probe_wait;
 			ae_set_state(h, AE_ST_PROBE, AE_PH_PASSIVE_WAIT);
 			ae_logev("%s : fail threshold reached, entering probe (pass-only window)", h->host);
+			ae_bus_emit(h->host, "AE_SUSPECT", "signal=%s l7=%s window=%d", reason, ae_l7_str(l7idx), params.autoexclude_fail_window);
 			h->po_attempts = 0;
 			h->po_rst = 0;
+			h->probe_weak = false;
 		}
 		break;
 	case AE_ST_PROBE:
@@ -985,6 +1054,7 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx)
 				ae_child_close();
 			}
 #endif
+			ae_bus_emit(h->host, "AE_PROBE_B2", "source=client result=fail signal=%s", reason);
 			ae_verdict_excluded(h);
 		}
 		// PASSIVE_WAIT/CURL_B1 : host is pass-only, failures are not expected. ignore
@@ -996,6 +1066,8 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx)
 		h->fail_count = 1;
 		ae_set_state(h, AE_ST_COLLECT, AE_PH_NONE);
 		ae_logev("%s : failed flow (%s) after clean period, collecting again 1/%u", h->host, reason, ae_fail_threshold(h));
+		ae_bus_emit(h->host, "AE_FAIL", "signal=%s l7=%s count=1 threshold=%u fresh=1",
+			reason, ae_l7_str(l7idx), ae_fail_threshold(h));
 		break;
 	default:
 		// AE_ST_EXCLUDED / AE_ST_NOTCAND : pass-only or cooldown, ignore
@@ -1016,13 +1088,17 @@ static void ae_flow_succeeded(const char *hostname)
 	{
 		if (h->fail_count)
 		{
+			ae_bus_emit(h->host, "AE_SUCCESS", "context=fail_counter_reset l7=%s", ae_l7_str(h->last_fail_l7));
 			h->fail_count = 0;
 			h->fail_head = 0;
 			ae_logev("%s : flow succeeded with tampering : fail counter reset", h->host);
 		}
 	}
 	else if (h->state == AE_ST_PROBE && h->phase == AE_PH_REATTACK)
+	{
+		ae_bus_emit(h->host, "AE_SUCCESS", "context=reattack l7=%s", ae_l7_str(h->last_fail_l7));
 		ae_verdict_transient(h, "client success under re-attack");
+	}
 }
 
 static void ae_probe_success(const char *hostname)
@@ -1051,6 +1127,8 @@ static void ae_probe_success(const char *hostname)
 		h->deadline = time(NULL) + params.autoexclude_reattack_window;
 		ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
 		ae_logev("%s : client success in pass-only window (B1), re-attacking for %d s", h->host, params.autoexclude_reattack_window);
+		ae_bus_emit(h->host, "AE_PROBE_B1", "source=client result=ok");
+		h->probe_weak = false; // real data reached the client : strong proof
 	}
 	// other states : no event
 }
@@ -1648,7 +1726,7 @@ static void ae_scan_conntrack(time_t nowboot)
 		if (nowboot - t->pos.t_last.tv_sec >= params.autoexclude_fail_silence)
 		{
 			t->ae_finalized = true;
-			ae_flow_failed(t->hostname, "silence", ae_l7_idx(t->l7proto));
+			ae_flow_failed(t->hostname, "silence", ae_l7_idx(t->l7proto), t);
 		}
 	}
 }
@@ -1712,6 +1790,8 @@ void ae_timer(void)
 						ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
 						ae_logev("%s : weak B1 : %u pass-only attempt(s) without an RST, re-attacking for %d s",
 							h->host, h->po_attempts, params.autoexclude_reattack_window);
+						ae_bus_emit(h->host, "AE_PROBE_B1", "source=client result=weak po_attempts=%u", h->po_attempts);
+						h->probe_weak = true;
 						break;
 					}
 #ifdef AE_CAN_FORK
@@ -1725,6 +1805,7 @@ void ae_timer(void)
 						if (now >= t_end)
 						{
 							ae_logev("%s : probe window expired without a verdict : returned to processing", h->host);
+							ae_bus_emit(h->host, "AE_VERDICT", "verdict=INCONCLUSIVE reason=probe_window_expired");
 							h->fail_count = 0;
 							h->fail_head = 0;
 							ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
@@ -1741,6 +1822,7 @@ void ae_timer(void)
 				{
 					// child finished without a dispatch (should not happen)
 					ae_logev("%s : probe child lost : returned to processing", h->host);
+					ae_bus_emit(h->host, "AE_VERDICT", "verdict=INCONCLUSIVE reason=probe_child_lost");
 					h->fail_count = 0;
 					h->fail_head = 0;
 					ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
@@ -1764,6 +1846,7 @@ void ae_timer(void)
 						if (now >= t_end)
 						{
 							ae_logev("%s : re-attack window expired without a verdict : returned to processing", h->host);
+							ae_bus_emit(h->host, "AE_VERDICT", "verdict=INCONCLUSIVE reason=reattack_window_expired");
 							h->fail_count = 0;
 							h->fail_head = 0;
 							ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
