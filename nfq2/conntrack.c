@@ -220,6 +220,9 @@ static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
 	int n;
 	struct timespec wall;
 	if (!params.adaptive_events_file[0] || !t || !t->flow_id) return;
+	/* Keep file traces complete, but do not let unassigned conntrack entries
+	 * consume the live controller's bounded open-flow table. */
+	if (!strncmp(params.adaptive_events_file, "unix:", 5) && !t->strategy_assigned) return;
 	snprintf(scope, sizeof(scope), "%s", t->adaptive_scope[0] ? t->adaptive_scope : "default");
 	for (h=scope; *h; h++) if (*h=='\t' || *h=='\r' || *h=='\n') *h='_';
 	h = t->hostname ? t->hostname : "";
@@ -780,6 +783,9 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 	snprintf(track->adaptive_scope, sizeof(track->adaptive_scope), "%s", scope ? scope : "default");
 	track->strategy_generation = pinned ? track->candidate_generation : adaptive_strategy_seq++;
 	track->strategy_assigned = true;
+	/* A live controller flow starts at the point of authoritative assignment.
+	 * Keep lifecycle order and source-port association for canary probes. */
+	adaptive_emit(track, "FLOW_START", "");
 	adaptive_emit(track, "STRATEGY_APPLIED", "");
 	if (selected_strategy) *selected_strategy = strategy_id;
 	return true;
