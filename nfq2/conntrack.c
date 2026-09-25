@@ -269,7 +269,7 @@ void adaptive_emit_host(const char *event, const char *host, const char *payload
 	clock_gettime(CLOCK_REALTIME, &wall);
 	now_ms = (unsigned long long)wall.tv_sec*1000 + wall.tv_nsec/1000000;
 	n = snprintf(line, sizeof(line),
-		"v2\t%llu\t%s\t0\t%u\t%u\t0\tae\t%s\t\t\t\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t%llu\t%llu\t0\t0\t%s\n",
+		"v4\t%llu\t%s\t0\t%u\t%u\t0\tae\t%s\t\t\t\t0\t\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t%llu\t%llu\t0\t0\t0\t0\t%s\n",
 		now_ms, event, profile_id, strategy_id, hostbuf, now_ms, now_ms, paybuf);
 	if (n<=0 || (size_t)n>=sizeof(line)) return;
 	(void)adaptive_write_line(line, (size_t)n);
