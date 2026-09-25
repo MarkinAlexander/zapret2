@@ -796,6 +796,8 @@ void ae_hook_retrans(t_ctrack *ctrack, const struct dissect *dis)
 
 void ae_hook_udp(t_ctrack *ctrack, const t_ctrack_positions *tpos)
 {
+	ae_host *h;
+
 	if (!params.ae_inited || !ctrack || !ctrack->hostname || ctrack->hostname_is_ip) return;
 	if (!ctrack->ae_attacked || ctrack->ae_finalized) return;
 
@@ -807,6 +809,24 @@ void ae_hook_udp(t_ctrack *ctrack, const t_ctrack_positions *tpos)
 	}
 	else if (tpos->client.pcounter >= params.autoexclude_udp_out)
 	{
+		// QUIC failing while the same host demonstrably works over TCP is
+		// not evidence against the bypass : browsers race QUIC against TCP
+		// and many setups deliberately break QUIC to force TCP. a recent
+		// attack-success in tls/http l7 suppresses the udp fail
+		h = ae_find(ctrack->hostname);
+		if (h)
+		{
+			time_t now = time(NULL);
+			int l7;
+			for (l7 = AE_L7_TLS; l7 <= AE_L7_HTTP; l7++)
+			{
+				for (uint8_t i = 0; i < h->ok_count[l7]; i++)
+				{
+					time_t t = h->ok_times[l7][(h->ok_head[l7] + 4 - h->ok_count[l7] + i) % 4];
+					if (t > now - AE_VETO_WINDOW) return; // host works over TCP : ignore the QUIC fail
+				}
+			}
+		}
 		ctrack->ae_finalized = true;
 		ae_flow_failed(ctrack->hostname, "udp", ae_l7_idx(ctrack->l7proto), ctrack);
 	}
