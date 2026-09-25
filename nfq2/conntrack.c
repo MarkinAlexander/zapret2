@@ -783,10 +783,13 @@ bool ConntrackSetStrategy(t_ctrack *track, uint32_t profile_id, uint32_t strateg
 	snprintf(track->adaptive_scope, sizeof(track->adaptive_scope), "%s", scope ? scope : "default");
 	track->strategy_generation = pinned ? track->candidate_generation : adaptive_strategy_seq++;
 	track->strategy_assigned = true;
-	/* A live controller flow starts at the point of authoritative assignment.
-	 * Keep lifecycle order and source-port association for canary probes. */
-	adaptive_emit(track, "FLOW_START", "");
-	adaptive_emit(track, "STRATEGY_APPLIED", "");
+	/* A live controller flow starts at authoritative assignment and carries
+	 * the strategy snapshot in the same datagram. File traces keep the separate
+	 * STRATEGY_APPLIED event for offline compatibility. */
+	if (!strncmp(params.adaptive_events_file, "unix:", 5))
+		adaptive_emit(track, "FLOW_START", "");
+	else
+		adaptive_emit(track, "STRATEGY_APPLIED", "");
 	if (selected_strategy) *selected_strategy = strategy_id;
 	return true;
 }
