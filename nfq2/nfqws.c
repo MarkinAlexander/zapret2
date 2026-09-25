@@ -2261,6 +2261,8 @@ static void exithelp(void)
 		" --autoexclude-sticky-after=<int>\t\t; exclusions before permanent, 0 = never (default : %d)\n"
 		" --autoexclude-mirror-file=<filename>\t\t; flash mirror for reboot survival, empty prefix to disable (default : %s)\n"
 		" --autoexclude-mirror-interval=<int>\t\t; flash mirror cadence in seconds (default : %d)\n"
+		" --autoexclude-veto-file=<filename>\t\t; user-managed never-exclude hostlist, hot reloaded (default : %s)\n"
+		" --autoexclude-recheck-interval=<int>\t\t; recheck excluded hosts this often, 0 = never (default : %d)\n"
 		" --autoexclude-max-hosts=<int>\t\t\t; max tracked hosts (default : %d)\n"
 		" --autoexclude-mode=<hybrid|passive>\t\t; passive never sends probe traffic (default : hybrid)\n"
 		"\nLUA PACKET PASS MODE:\n"
@@ -2286,7 +2288,7 @@ static void exithelp(void)
 		AE_PROBE_WAIT_DEFAULT, AE_PROBE_WINDOW_DEFAULT, AE_REATTACK_WINDOW_DEFAULT,
 		AE_PROBE_MAXTIME_DEFAULT, AE_TTL_FIRST_DEFAULT, AE_TTL_DEFAULT,
 		AE_TTL_MAX_DEFAULT, AE_COOLDOWN_DEFAULT, AE_STICKY_AFTER_DEFAULT,
-		AE_MIRROR_FILE_DEFAULT, AE_MIRROR_INTERVAL_DEFAULT, AE_MAX_HOSTS_DEFAULT,
+		AE_MIRROR_FILE_DEFAULT, AE_MIRROR_INTERVAL_DEFAULT, AE_VETO_FILE_DEFAULT, AE_RECHECK_INTERVAL_DEFAULT, AE_MAX_HOSTS_DEFAULT,
 		all_payloads
 	);
 	close_std_and_exit(1);
@@ -2419,6 +2421,8 @@ enum opt_indices {
 	IDX_AUTOEXCLUDE_STICKY_AFTER,
 	IDX_AUTOEXCLUDE_MIRROR_FILE,
 	IDX_AUTOEXCLUDE_MIRROR_INTERVAL,
+	IDX_AUTOEXCLUDE_VETO_FILE,
+	IDX_AUTOEXCLUDE_RECHECK_INTERVAL,
 	IDX_AUTOEXCLUDE_MAX_HOSTS,
 	IDX_AUTOEXCLUDE_MODE,
 	IDX_NEW,
@@ -2559,6 +2563,8 @@ static const struct option long_options[] = {
 	[IDX_AUTOEXCLUDE_STICKY_AFTER] = {"autoexclude-sticky-after", required_argument, 0, 0},
 	[IDX_AUTOEXCLUDE_MIRROR_FILE] = {"autoexclude-mirror-file", required_argument, 0, 0},
 	[IDX_AUTOEXCLUDE_MIRROR_INTERVAL] = {"autoexclude-mirror-interval", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_VETO_FILE] = {"autoexclude-veto-file", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_RECHECK_INTERVAL] = {"autoexclude-recheck-interval", required_argument, 0, 0},
 	[IDX_AUTOEXCLUDE_MAX_HOSTS] = {"autoexclude-max-hosts", required_argument, 0, 0},
 	[IDX_AUTOEXCLUDE_MODE] = {"autoexclude-mode", required_argument, 0, 0},
 	[IDX_NEW] = {"new", optional_argument, 0, 0},
@@ -3385,6 +3391,21 @@ int main(int argc, char **argv)
 			if (params.autoexclude_mirror_interval < 600)
 			{
 				DLOG_ERR("autoexclude-mirror-interval must be at least 600 s (flash friendliness)\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_VETO_FILE:
+			if (!realpath_any(optarg,params.autoexclude_veto_file))
+			{
+				DLOG_ERR("bad file '%s'\n",optarg);
+				exit_clean(1);
+			}
+			break;
+		case IDX_AUTOEXCLUDE_RECHECK_INTERVAL:
+			params.autoexclude_recheck_interval = atoi(optarg);
+			if (params.autoexclude_recheck_interval < 0 || params.autoexclude_recheck_interval > 604800)
+			{
+				DLOG_ERR("autoexclude-recheck-interval must be within 0..604800 (0 = never)\n");
 				exit_clean(1);
 			}
 			break;

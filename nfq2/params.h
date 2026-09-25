@@ -58,8 +58,13 @@
 #define AE_COOLDOWN_DEFAULT		1800
 #define AE_MAX_HOSTS_DEFAULT		256
 #define AE_STICKY_AFTER_DEFAULT		3	// exclusions before an exclusion becomes permanent
-#define AE_MIRROR_FILE_DEFAULT		"/opt/zator/lists/netrogat-auto.txt"
+// flash persistence is opt-in : the engine keeps everything in memory (tmpfs
+// working files) and re-earns exclusions after a reboot through the reduced
+// recidive threshold, flash stays untouched unless a mirror is asked for
+#define AE_MIRROR_FILE_DEFAULT		""
 #define AE_MIRROR_INTERVAL_DEFAULT	21600	// flash mirror cadence, seconds
+#define AE_VETO_FILE_DEFAULT		"/opt/zator/lists/netrogat-veto.txt"
+#define AE_RECHECK_INTERVAL_DEFAULT	21600	// recheck cadence for excluded hosts, seconds (0 = never)
 
 #define IPCACHE_LIFETIME		7200
 
@@ -213,6 +218,8 @@ struct params_s
 	int autoexclude_sticky_after;	// exclusions before permanent (0 = never)
 	char autoexclude_mirror_file[PATH_MAX]; // flash mirror, empty = disabled
 	int autoexclude_mirror_interval;
+	char autoexclude_veto_file[PATH_MAX]; // user-managed never-exclude hostlist
+	int autoexclude_recheck_interval; // periodic recheck of excluded hosts, seconds (0 = never)
 	bool autoexclude_passive;	// no active probing, passive differential only
 	bool ae_inited;		// runtime : ae_init succeeded
 

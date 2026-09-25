@@ -65,6 +65,8 @@ typedef struct ae_host {
 	bool adopted;		// external controller owns this host : engine ignores it
 	bool force_attack;	// owner override : this exact host must stay attacked even
 				// when a parent domain is pass-only. persisted in the state file
+	bool recheck;		// the current probe cycle is a periodic recheck of an exclusion
+	time_t next_recheck;	// when an excluded host must be rechecked (0 = unscheduled)
 	UT_hash_handle hh;
 } ae_host;
 
@@ -108,9 +110,12 @@ typedef struct ae_ip {
 
 static ae_host *ae_hosts = NULL;
 static ae_manual *ae_manual_hosts = NULL;
+static ae_manual *ae_veto_hosts = NULL;
 static ae_ip *ae_ip_hosts = NULL;
 static file_mod_sig ae_manual_mod;
 static time_t ae_manual_last_check;
+static file_mod_sig ae_veto_mod;
+static time_t ae_veto_last_check;
 static bool ae_dirty_list;		// pass-only set changed, list file rewrite is pending
 static bool ae_dirty_state;	// durable state changed, state file rewrite is pending
 static time_t ae_last_save_list, ae_last_save_state;
@@ -124,6 +129,7 @@ static void ae_flow_succeeded(const char *hostname);
 static void ae_probe_success(const char *hostname);
 static ae_host * ae_find(const char *hostname);
 static bool ae_adopted_match(const char *hostname);
+static bool ae_veto_match(const char *hostname);
 
 #ifdef AE_CAN_FORK
 static struct {
@@ -131,6 +137,7 @@ static struct {
 	pid_t pid;
 	int fd;				// read end of the result pipe
 	uint8_t phase;			// AE_PH_CURL_B1 or AE_PH_CURL_B2
+	bool recheck;			// this probe is a periodic recheck of an excluded host
 	char host[AE_HOST_LEN_MAX + 1];
 	time_t deadline;
 } ae_child;
@@ -430,19 +437,21 @@ static void ae_ok_note(const char *hostname, int l7idx)
 	h->t_last_activity = now;
 }
 
-// true when the host worked under tampering recently in the same l7 that is
-// now failing. such hosts are served by zapret : exclusion would remove the
-// bypass and break them for real (youtube-class false positive)
-static bool ae_veto(const ae_host *h)
+// schedule the next periodic recheck of an excluded host. direct access may
+// die while the exclusion lives (provider starts blocking the site) - the
+// recheck re-proves the premise "works without tampering" from time to time
+// and releases the host when the bypass becomes the only working path.
+// jitter spreads rechecks so they never burst
+static void ae_recheck_schedule(ae_host *h)
 {
 	time_t now = time(NULL);
-	int i, n = 0;
+	unsigned hash = 5381;
+	const char *p;
 
-	if (h->last_fail_l7 > AE_L7_OTHER) return false;
-	for (i = 0; i < 4; i++)
-		if (h->ok_times[h->last_fail_l7][i] >= now - AE_VETO_WINDOW)
-			n++;
-	return n >= AE_VETO_OK;
+	if (!params.autoexclude_recheck_interval) { h->next_recheck = 0; return; }
+	for (p = h->host; *p; p++) hash = hash * 33 + (unsigned char)*p;
+	h->next_recheck = now + params.autoexclude_recheck_interval +
+		(time_t)(hash % (unsigned)params.autoexclude_recheck_interval / 12 + 30);
 }
 
 static uint8_t ae_fail_threshold(const ae_host *h)
@@ -550,6 +559,7 @@ static bool ae_probe_spawn(ae_host *h, uint8_t phase)
 	ae_child.pid = pid;
 	ae_child.fd = pipefd[0];
 	ae_child.phase = phase;
+	ae_child.recheck = h->recheck;
 	snprintf(ae_child.host, sizeof(ae_child.host), "%s", h->host);
 	ae_child.deadline = time(NULL) + params.autoexclude_probe_maxtime + 5;
 	return true;
@@ -561,19 +571,6 @@ static bool ae_probe_spawn(ae_host *h, uint8_t phase)
 static void ae_verdict_excluded(ae_host *h)
 {
 	uint32_t ttl = ae_ttl_for(h);
-
-	// veto : the host works under tampering in the failing l7. zapret is
-	// serving it (provider-blocked and bypassed) - exclusion would remove
-	// the bypass and break it for real
-	if (ae_veto(h))
-	{
-		ae_logev("%s : veto : works under tampering, zapret is helping this host. not excluding", h->host);
-		ae_bus_emit(h->host, "AE_VETO", "at=verdict l7=%s", ae_l7_str(h->last_fail_l7));
-		h->fail_count = 0;
-		h->fail_head = 0;
-		ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
-		return;
-	}
 
 	{
 		bool bweak = h->probe_weak;
@@ -591,6 +588,7 @@ static void ae_verdict_excluded(ae_host *h)
 		{
 			h->exclude_until = 0; // forever
 			ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+			ae_recheck_schedule(h);
 			ae_logev("%s : verdict WE_BROKE_IT : chronic (exclusion #%u, strong %u) : permanent, remove the line manually to re-enable",
 				h->host, h->n_exclusions, h->n_strong);
 			ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=permanent exclusion=%u proof=strong", h->n_exclusions);
@@ -600,6 +598,7 @@ static void ae_verdict_excluded(ae_host *h)
 
 		h->exclude_until = time(NULL) + ttl;
 		ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+		ae_recheck_schedule(h);
 		ae_logev("%s : verdict WE_BROKE_IT : excluded for %u s (exclusion #%u%s)", h->host, ttl, h->n_exclusions, bweak ? ", weak proof" : "");
 		ae_bus_emit(h->host, "AE_VERDICT", "verdict=WE_BROKE_IT ttl=%u exclusion=%u proof=%s", ttl, h->n_exclusions, bweak ? "weak" : "strong");
 	}
@@ -625,13 +624,80 @@ static void ae_verdict_transient(ae_host *h, const char *reason)
 
 #ifdef AE_CAN_FORK
 
+// outcome of a periodic recheck of an excluded host. the host stays pass-only
+// through B1 (the curl goes the direct path), B2 re-attacks it for the usual
+// short window. the only path that changes the exclusion is "direct broken +
+// bypass works" : the premise of the exclusion is gone, release the host and
+// cool down so the engine will not immediately re-exclude it
+static void ae_recheck_dispatch(ae_host *h, uint8_t phase, bool bok, bool binconclusive)
+{
+	time_t now = time(NULL);
+
+	h->recheck = false;
+
+	if (binconclusive)
+	{
+		// curl could not run : postpone, keep the exclusion untouched
+		ae_logev("%s : recheck inconclusive (curl unavailable) : exclusion kept, postponed", h->host);
+		ae_bus_emit(h->host, "AE_RECHECK", "phase=b1 result=postponed");
+		ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+		h->next_recheck = now + 300;
+		return;
+	}
+
+	if (phase == AE_PH_CURL_B1)
+	{
+		if (bok)
+		{
+			// direct access still works : the exclusion premise holds
+			ae_logev("%s : recheck : direct access still works : exclusion kept", h->host);
+			ae_bus_emit(h->host, "AE_RECHECK", "phase=b1 result=direct_ok");
+			ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+			ae_recheck_schedule(h);
+			return;
+		}
+		// direct access died : is the bypass the working path now?
+		ae_logev("%s : recheck : direct access broken, re-attacking to test the bypass", h->host);
+		ae_bus_emit(h->host, "AE_RECHECK", "phase=b1 result=direct_fail");
+		h->recheck = true; // survives through the re-attack window into the b2 curl
+		h->deadline = now + params.autoexclude_reattack_window;
+		ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
+		return;
+	}
+
+	// phase == AE_PH_CURL_B2
+	if (bok)
+	{
+		// direct is dead while the bypass works : the exclusion would keep the
+		// site broken for the user. release, cool down, tell the user the veto
+		// list is the right place for this host now
+		ae_logev("%s : recheck : direct access broken, bypass required : RELEASED, consider adding the host to the veto list",
+			h->host);
+		ae_bus_emit(h->host, "AE_RECHECK", "phase=b2 result=bypass_needed");
+		ae_verdict_notcand(h, "recheck : direct broken, bypass works");
+		return;
+	}
+	// both paths are dead : the site itself is down, the exclusion is harmless
+	ae_logev("%s : recheck : site appears down entirely : exclusion kept", h->host);
+	ae_bus_emit(h->host, "AE_RECHECK", "phase=b2 result=site_down");
+	ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+	ae_recheck_schedule(h);
+}
+
 static void ae_child_dispatch(bool bok, bool binconclusive)
 {
 	ae_host *h = ae_find(ae_child.host);
 	uint8_t phase = ae_child.phase;
+	bool brecheck = ae_child.recheck;
 
 	ae_child_close();
 	if (!h || h->state != AE_ST_PROBE) return;
+
+	if (brecheck)
+	{
+		ae_recheck_dispatch(h, phase, bok, binconclusive);
+		return;
+	}
 
 	if (binconclusive)
 	{
@@ -1007,6 +1073,16 @@ void ae_passonly_rst(const char *hostname)
 			h->probe_attempts = 0;
 		}
 #endif
+		if (h->recheck)
+		{
+			// direct access looks broken, but releasing needs the bypass
+			// confirmed first : run the b2 test instead of the verdict
+			ae_logev("%s : recheck : clean traffic RST, testing the bypass before releasing", h->host);
+			ae_bus_emit(h->host, "AE_RECHECK", "phase=b1 result=direct_fail source=client_rst");
+			h->deadline = time(NULL) + params.autoexclude_reattack_window;
+			ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
+			return;
+		}
 		ae_verdict_notcand(h, "clean traffic got RST without tampering");
 	}
 }
@@ -1077,13 +1153,13 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, 
 			reason, ae_l7_str(l7idx), h->fail_count, ae_fail_threshold(h));
 		if (h->fail_count >= ae_fail_threshold(h))
 		{
-			// veto : this host works under tampering, zapret serves it.
-			// failing flows are a strategy problem (rotation territory),
-			// not a reason to remove the bypass
-			if (ae_veto(h))
+			// user-managed veto : the user declares this host is served by
+			// the bypass, failing flows are a strategy problem (rotation
+			// territory), not a reason to remove the bypass
+			if (ae_veto_match(h->host))
 			{
-				ae_logev("%s : threshold reached but host works under tampering, zapret is helping it. not probing", h->host);
-				ae_bus_emit(h->host, "AE_VETO", "at=threshold l7=%s", ae_l7_str(l7idx));
+				ae_logev("%s : threshold reached but host is on the veto list, zapret is serving it. not probing", h->host);
+				ae_bus_emit(h->host, "AE_VETO", "at=manual_list");
 				h->fail_count = 0;
 				h->fail_head = 0;
 				break;
@@ -1110,6 +1186,19 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, 
 				ae_child_close();
 			}
 #endif
+			if (h->recheck)
+			{
+				// recheck b2 : the bypass is not working for the client either.
+				// both paths broken (or the site is down) : the exclusion is
+				// harmless, keep it - re-deriving WE_BROKE_IT would only churn
+				// the exclusion counters of an already-excluded host
+				ae_bus_emit(h->host, "AE_RECHECK", "phase=b2 result=bypass_fail source=client");
+				h->recheck = false;
+				ae_logev("%s : recheck : bypass not working for the client either : exclusion kept", h->host);
+				ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+				ae_recheck_schedule(h);
+				break;
+			}
 			ae_bus_emit(h->host, "AE_PROBE_B2", "source=client result=fail signal=%s", reason);
 			ae_verdict_excluded(h);
 		}
@@ -1155,6 +1244,15 @@ static void ae_flow_succeeded(const char *hostname)
 	}
 	else if (h->state == AE_ST_PROBE && h->phase == AE_PH_REATTACK)
 	{
+		if (h->recheck)
+		{
+			// recheck b2 : the bypass works for the client while direct access
+			// was broken : the exclusion premise is gone, release (the transient
+			// verdict does exactly that) and point the user at the veto list
+			ae_bus_emit(h->host, "AE_RECHECK", "phase=b2 result=bypass_needed source=client");
+			ae_logev("%s : recheck : direct access broken, bypass required : RELEASED, consider adding the host to the veto list", h->host);
+			h->recheck = false;
+		}
 		ae_bus_emit(h->host, "AE_SUCCESS", "context=reattack l7=%s", ae_l7_str(h->last_fail_l7));
 		ae_verdict_transient(h, "client success under re-attack");
 	}
@@ -1171,6 +1269,26 @@ static void ae_probe_success(const char *hostname)
 
 	if (h->state == AE_ST_PROBE && (h->phase == AE_PH_PASSIVE_WAIT || h->phase == AE_PH_CURL_B1))
 	{
+		if (h->recheck)
+		{
+			// client traffic on the pass-only host is itself the direct-access
+			// proof the recheck wants : the exclusion premise holds, no probe
+			// cycle, no counter churn
+#ifdef AE_CAN_FORK
+			if (ae_child.active && ae_child.phase == AE_PH_CURL_B1 && !strcmp(ae_child.host, h->host))
+			{
+				kill(ae_child.pid, SIGKILL);
+				waitpid(ae_child.pid, NULL, 0);
+				ae_child_close();
+			}
+#endif
+			h->recheck = false;
+			ae_logev("%s : recheck : client confirmed direct access works : exclusion kept", h->host);
+			ae_bus_emit(h->host, "AE_RECHECK", "phase=b1 result=direct_ok source=client");
+			ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+			ae_recheck_schedule(h);
+			return;
+		}
 		// passive B1 : client traffic works without tampering. accepted during
 		// the active B1 too : browsers retry and beat the per-connection
 		// cdn lottery faster than sequential probe attempts
@@ -1380,6 +1498,77 @@ static void ae_manual_reload(bool bForce)
 			DLOG("autoexclude : manual list %s loaded (%u hosts)\n", params.autoexclude_manual_file, HASH_COUNT(ae_manual_hosts));
 		}
 	}
+}
+
+// ---------------- user-managed veto list ----------------
+// hosts the user declares as served by the bypass : the engine never
+// suspects or excludes them (exclusion would remove a working bypass).
+// replaces the old automatic "works under tampering" heuristic : the
+// decision is the user's, the engine only proves per-flow facts
+
+static void ae_veto_line_cb(const char *line, void *ctx)
+{
+	ae_manual *m;
+	size_t l = strlen(line);
+
+	(void)ctx;
+	HASH_FIND(hh, ae_veto_hosts, line, l, m);
+	if (m) return;
+	m = (ae_manual*)malloc(sizeof(ae_manual));
+	if (!m) return;
+	if (!(m->str = malloc(l + 1))) { free(m); return; }
+	memcpy(m->str, line, l + 1);
+	HASH_ADD_KEYPTR(hh, ae_veto_hosts, m->str, l, m);
+}
+
+static void ae_veto_reload(bool bForce)
+{
+	file_mod_sig ms;
+	time_t now = time(NULL);
+
+	if (!bForce && now - ae_veto_last_check < 5) return;
+	ae_veto_last_check = now;
+	if (!*params.autoexclude_veto_file) return;
+	if (file_mod_signature(params.autoexclude_veto_file, &ms) &&
+	    (bForce || memcmp(&ms, &ae_veto_mod, sizeof(ms))))
+	{
+		ae_manual *m, *tmp;
+		HASH_ITER(hh, ae_veto_hosts, m, tmp)
+		{
+			HASH_DEL(ae_veto_hosts, m);
+			free(m->str);
+			free(m);
+		}
+		ae_veto_hosts = NULL;
+		if (ae_file_read_lines(params.autoexclude_veto_file, ae_veto_line_cb, NULL))
+		{
+			ae_veto_mod = ms;
+			DLOG("autoexclude : veto list %s loaded (%u hosts)\n", params.autoexclude_veto_file, HASH_COUNT(ae_veto_hosts));
+		}
+	}
+}
+
+static bool ae_veto_match(const char *hostname)
+{
+	char buf[AE_HOST_LEN_MAX + 1];
+	const char *p = hostname;
+	size_t l;
+
+	for (;;)
+	{
+		l = strlen(p);
+		if (!l || l > AE_HOST_LEN_MAX) return false;
+		memcpy(buf, p, l + 1);
+		ae_lowercase(buf);
+		ae_manual *m;
+		HASH_FIND(hh, ae_veto_hosts, buf, l, m);
+		if (m) return true;
+		p = strchr(p, '.');
+		if (!p) return false;
+		p++;
+		if (!strchr(p, '.')) return false;
+	}
+	return false;
 }
 
 struct ae_load_ctx {
@@ -1636,6 +1825,7 @@ static void ae_control_exclude(const char *host, const char *arg)
 	h->fail_head = 0;
 	h->exclude_until = ttl ? time(NULL) + ttl : 0;
 	ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+	ae_recheck_schedule(h);
 	ae_dirty_state = true;
 	if (ttl)
 	{
@@ -2107,6 +2297,7 @@ void ae_init(void)
 	ae_state_path();
 	ae_mirror_restore();
 	ae_manual_reload(true);
+	ae_veto_reload(true);
 
 	ctx.now = time(NULL);
 	ctx.bHaveState = false;
@@ -2201,6 +2392,7 @@ void ae_timer(void)
 
 	ae_scan_conntrack(boottime());
 	ae_manual_reload(false);
+	ae_veto_reload(false);
 	ae_list_check();
 	ae_control_check();
 	ae_mirror_update(false);
@@ -2274,6 +2466,17 @@ void ae_timer(void)
 #ifdef AE_CAN_FORK
 				if (!ae_child.active || strcmp(ae_child.host, h->host))
 				{
+					if (h->recheck)
+					{
+						// child finished without a dispatch mid-recheck :
+						// keep the exclusion, just postpone the next attempt
+						h->recheck = false;
+						ae_logev("%s : recheck child lost : exclusion kept, postponed", h->host);
+						ae_bus_emit(h->host, "AE_RECHECK", "result=postponed reason=child_lost");
+						ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+						h->next_recheck = now + 300;
+						break;
+					}
 					// child finished without a dispatch (should not happen)
 					ae_logev("%s : probe child lost : returned to processing", h->host);
 					ae_bus_emit(h->host, "AE_VERDICT", "verdict=INCONCLUSIVE reason=probe_child_lost");
@@ -2297,7 +2500,17 @@ void ae_timer(void)
 #endif
 					{
 						time_t t_end = h->t_state + params.autoexclude_probe_window;
-						if (now >= t_end)
+						if (h->recheck)
+						{
+							// could not spawn the b2 curl mid-recheck : keep the
+							// exclusion, postpone the next attempt
+							h->recheck = false;
+							ae_logev("%s : recheck re-attack window expired without a b2 probe : exclusion kept, postponed", h->host);
+							ae_bus_emit(h->host, "AE_RECHECK", "result=postponed reason=b2_unavailable");
+							ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+							h->next_recheck = now + 300;
+						}
+						else if (now >= t_end)
 						{
 							ae_logev("%s : re-attack window expired without a verdict : returned to processing", h->host);
 							ae_bus_emit(h->host, "AE_VERDICT", "verdict=INCONCLUSIVE reason=reattack_window_expired");
@@ -2320,6 +2533,31 @@ void ae_timer(void)
 				// a still-broken site re-suspends fast through the reduced threshold
 				ae_logev("%s : ttl expired, returning to processing (reprobe)", h->host);
 				ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
+				break;
+			}
+			// periodic recheck : the "works without tampering" premise must be
+			// re-proven while the exclusion lives, permanent ones have no ttl
+			// to do it for them. one recheck at a time (single probe child)
+			if (params.autoexclude_recheck_interval)
+			{
+				if (!h->next_recheck) ae_recheck_schedule(h);
+				else if (now >= h->next_recheck)
+				{
+#ifdef AE_CAN_FORK
+					if (!params.autoexclude_passive && !ae_child.active && !h->adopted && !h->force_attack)
+					{
+						h->recheck = true;
+						if (ae_probe_spawn(h, AE_PH_CURL_B1))
+						{
+							ae_logev("%s : recheck due : probing direct access", h->host);
+							ae_set_state(h, AE_ST_PROBE, AE_PH_CURL_B1);
+							break;
+						}
+						h->recheck = false;
+					}
+#endif
+					h->next_recheck = now + 300; // busy or passive : retry later
+				}
 			}
 			break;
 		case AE_ST_NOTCAND:

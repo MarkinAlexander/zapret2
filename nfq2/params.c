@@ -594,6 +594,8 @@ void init_params(struct params_s *params)
 	params->autoexclude = true;
 	snprintf(params->autoexclude_file, sizeof(params->autoexclude_file), "%s", AE_FILE_DEFAULT);
 	snprintf(params->autoexclude_manual_file, sizeof(params->autoexclude_manual_file), "%s", AE_MANUAL_FILE_DEFAULT);
+	snprintf(params->autoexclude_veto_file, sizeof(params->autoexclude_veto_file), "%s", AE_VETO_FILE_DEFAULT);
+	params->autoexclude_recheck_interval = AE_RECHECK_INTERVAL_DEFAULT;
 	snprintf(params->autoexclude_curl, sizeof(params->autoexclude_curl), "%s", AE_CURL_DEFAULT);
 	// event log is on by default : /tmp is writable by the daemon user and
 	// survives nothing (tmpfs), which is fine for an observability log
