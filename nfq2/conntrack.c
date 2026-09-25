@@ -3,6 +3,7 @@
 #include "darkmagic.h"
 #include <arpa/inet.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "params.h"
 #include "lua.h"
@@ -17,7 +18,9 @@
 #endif
 
 static void taddr2str(uint8_t l3proto, const t_addr *a, char *buf, size_t bufsize);
-static uint64_t adaptive_flow_seq = 1;
+static uint64_t adaptive_flow_seq;
+static bool adaptive_flow_seq_initialized;
+static bool adaptive_flow_seq_exhausted;
 static uint64_t adaptive_strategy_seq = 1;
 static uint64_t adaptive_candidate_generation = 1;
 static uint64_t adaptive_host_strategy_generation = 1;
@@ -28,14 +31,92 @@ struct adaptive_host_strategy {
 	char host[256];
 };
 static struct adaptive_host_strategy adaptive_host_strategies[ADAPTIVE_HOST_STRATEGIES_MAX];
-#define ADAPTIVE_EVENTS_MAX_BYTES (4U * 1024U * 1024U)
+#define ADAPTIVE_EVENTS_MAX_BYTES (512U * 1024U)
 static bool adaptive_trace_limited;
-static const char adaptive_trace_limit_marker[] = "# TRACE_LIMIT\tmax_bytes=4194304\n";
+static const char adaptive_trace_limit_marker[] = "# TRACE_LIMIT\tmax_bytes=524288\n";
 #ifdef __linux__
 static int adaptive_event_socket = -1;
 static uint64_t adaptive_event_drops;
 #endif
 static int adaptive_event_file_fd = -1;
+
+static uint64_t adaptive_flow_id_next(void)
+{
+	struct timespec started;
+	uint64_t id;
+	if (adaptive_flow_seq_exhausted) return 0;
+	if (!adaptive_flow_seq_initialized) {
+		uint64_t seed;
+		if (clock_gettime(CLOCK_REALTIME, &started) != 0) {
+			started.tv_sec = time(NULL);
+			started.tv_nsec = 0;
+		}
+		seed = ((uint64_t)(uint32_t)getpid() << 32) ^
+			(uint64_t)started.tv_sec ^ ((uint64_t)started.tv_nsec << 1);
+		seed ^= seed >> 30;
+		seed *= UINT64_C(0xbf58476d1ce4e5b9);
+		seed ^= seed >> 27;
+		seed *= UINT64_C(0x94d049bb133111eb);
+		seed ^= seed >> 31;
+		adaptive_flow_seq = seed ? seed : 1;
+		adaptive_flow_seq_initialized = true;
+	}
+	id = adaptive_flow_seq;
+	if (adaptive_flow_seq == UINT64_MAX) adaptive_flow_seq_exhausted = true;
+	else adaptive_flow_seq++;
+	return id;
+}
+
+static bool adaptive_trace_has_limit_marker(int fd, off_t size, bool *found)
+{
+	char buffer[4096 + sizeof(adaptive_trace_limit_marker)-1];
+	size_t carry = 0;
+	off_t offset = 0;
+	*found = false;
+	while (offset < size) {
+		size_t want = size - offset > 4096 ? 4096 : (size_t)(size - offset);
+		ssize_t got;
+		size_t total, i;
+		if (lseek(fd, offset, SEEK_SET) < 0) return false;
+		got = read(fd, buffer + carry, want);
+		if (got <= 0) return false;
+		total = carry + (size_t)got;
+		for (i = 0; i + sizeof(adaptive_trace_limit_marker)-1 <= total; i++)
+			if (!memcmp(buffer + i, adaptive_trace_limit_marker,
+				sizeof(adaptive_trace_limit_marker)-1)) {
+				*found = true;
+				return true;
+			}
+		carry = total < sizeof(adaptive_trace_limit_marker)-1 ? total :
+			sizeof(adaptive_trace_limit_marker)-2;
+		memmove(buffer, buffer + total - carry, carry);
+		offset += got;
+	}
+	return true;
+}
+
+static bool adaptive_trace_file_prepare(int fd)
+{
+	struct stat st;
+	bool has_marker;
+	if (fstat(fd, &st) != 0 || st.st_size < 0) return false;
+	if ((uint64_t)st.st_size > ADAPTIVE_EVENTS_MAX_BYTES -
+		(sizeof(adaptive_trace_limit_marker)-1)) {
+		/* Discard an old oversized capture and leave an explicit incomplete trace. */
+		if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) < 0) return false;
+		if (write(fd, adaptive_trace_limit_marker,
+			sizeof(adaptive_trace_limit_marker)-1) !=
+			(ssize_t)(sizeof(adaptive_trace_limit_marker)-1)) {
+			adaptive_trace_limited = true;
+			return false;
+		}
+		adaptive_trace_limited = true;
+		return true;
+	}
+	if (!adaptive_trace_has_limit_marker(fd, st.st_size, &has_marker)) return false;
+	if (has_marker) adaptive_trace_limited = true;
+	return true;
+}
 
 void ConntrackAdaptiveTelemetryInit(void)
 {
@@ -46,8 +127,11 @@ void ConntrackAdaptiveTelemetryInit(void)
 	if (!strncmp(params.adaptive_events_file, "unix:", 5)) return;
 #endif
 	if (params.adaptive_events_file[0] && adaptive_event_file_fd < 0) {
-		adaptive_event_file_fd = open(params.adaptive_events_file, O_WRONLY|O_CREAT|O_APPEND, 0600);
+		adaptive_event_file_fd = open(params.adaptive_events_file, O_RDWR|O_CREAT|O_APPEND, 0600);
 		if (adaptive_event_file_fd >= 0 && fchmod(adaptive_event_file_fd, 0600) != 0) {
+			close(adaptive_event_file_fd);
+			adaptive_event_file_fd = -1;
+		} else if (adaptive_event_file_fd >= 0 && !adaptive_trace_file_prepare(adaptive_event_file_fd)) {
 			close(adaptive_event_file_fd);
 			adaptive_event_file_fd = -1;
 		}
@@ -144,7 +228,7 @@ static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
 	taddr2str(t->tuple.l3proto, &t->tuple.dst, dst, sizeof(dst));
 	clock_gettime(CLOCK_REALTIME, &wall);
 	n = snprintf(line, sizeof(line),
-		"v3\t%llu\t%s\t%" PRIu64 "\t%u\t%u\t%" PRIu64 "\t%s\t%s\t%s\t%s\t%s\t%u\t%u\t%llu\t%llu\t%llu\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%llu\t%llu\t%u\t%u\t%s\n",
+		"v4\t%llu\t%s\t%" PRIu64 "\t%u\t%u\t%" PRIu64 "\t%s\t%s\t%s\t%s\t%s\t%u\t%u\t%llu\t%llu\t%llu\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%llu\t%llu\t%u\t%u\t%llu\t%llu\t%s\n",
 		(unsigned long long)wall.tv_sec*1000 + wall.tv_nsec/1000000, event, t->flow_id, t->profile_id, t->strategy_id,
 		t->strategy_generation, scope, host, t->tuple.l4proto==IPPROTO_TCP ? "tcp" : (t->l7proto==L7_QUIC ? "quic" : "udp"),
 		t->tuple.l3proto==IPPROTO_IPV6 ? "ipv6" : "ipv4", dst, t->tuple.dport, t->tuple.sport, // t_conn ports are host order (extract_ports ntohs)
@@ -154,6 +238,8 @@ static void adaptive_emit(t_ctrack *t, const char *event, const char *reason)
 		t->client_fin, t->server_fin, (unsigned long long)t->t_start.tv_sec*1000 + t->t_start.tv_nsec/1000000,
 		(unsigned long long)t->pos.t_last.tv_sec*1000 + t->pos.t_last.tv_nsec/1000000,
 		(unsigned)t->clienthello_count, (unsigned)t->clienthello_retransmissions,
+		(unsigned long long)t->adaptive_injected_packets,
+		(unsigned long long)t->adaptive_injected_bytes,
 		reason ? reason : "");
 	if (n<=0 || (size_t)n>=sizeof(line)) return;
 	adaptive_write_line(line, (size_t)n);
@@ -180,6 +266,19 @@ void adaptive_emit_host(const char *event, const char *host, const char *payload
 		now_ms, event, profile_id, strategy_id, hostbuf, now_ms, now_ms, paybuf);
 	if (n<=0 || (size_t)n>=sizeof(line)) return;
 	adaptive_write_line(line, (size_t)n);
+}
+
+void ConntrackAdaptiveRecordInjection(t_ctrack *track, uint64_t packets, uint64_t bytes)
+{
+	if (!track) return;
+	if (UINT64_MAX - track->adaptive_injected_packets < packets)
+		track->adaptive_injected_packets = UINT64_MAX;
+	else
+		track->adaptive_injected_packets += packets;
+	if (UINT64_MAX - track->adaptive_injected_bytes < bytes)
+		track->adaptive_injected_bytes = UINT64_MAX;
+	else
+		track->adaptive_injected_bytes += bytes;
 }
 
 
@@ -498,8 +597,8 @@ static bool ConntrackPoolFeedPool(t_conntrack_pool **pp, const struct dissect *d
 ok:
 	ctr->track.pos.ipproto = proto;
 	if (!ctr->track.flow_id) {
-		ctr->track.flow_id = ((uint64_t)(uint32_t)getpid() << 32) |
-			(adaptive_flow_seq++ & UINT32_MAX);
+		ctr->track.flow_id = adaptive_flow_id_next();
+		if (!ctr->track.flow_id) return false;
 		ctr->track.tuple = ctr->conn;
 		adaptive_emit(&ctr->track, "FLOW_START", "");
 	}

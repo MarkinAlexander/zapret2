@@ -68,6 +68,7 @@ typedef struct
 	bool clienthello_seq_seen;
 	uint32_t clienthello_first_seq;
 	uint32_t clienthello_count, clienthello_retransmissions;
+	uint64_t adaptive_injected_packets, adaptive_injected_bytes;
 	t_conn tuple; // client-oriented tuple copied at flow creation
 
 	// this block of data can change between delayed (queued) packets. need to remeber this data for each packet for further replay
@@ -135,6 +136,7 @@ void ConntrackAdaptiveSetCandidate(uint32_t profile_id, uint32_t strategy_id);
 uint64_t ConntrackAdaptiveCandidateGeneration(void);
 bool ConntrackAdaptiveSetHostStrategy(uint32_t profile_id, const char *host,
 	uint32_t strategy_id, uint64_t *generation);
+void ConntrackAdaptiveRecordInjection(t_ctrack *track, uint64_t packets, uint64_t bytes);
 bool ConntrackAdaptiveClearHostStrategy(uint32_t profile_id, const char *host);
 bool ConntrackAdaptiveGetHostStrategy(uint32_t profile_id, const char *host,
 	uint32_t *strategy_id, uint64_t *generation);

@@ -3012,6 +3012,15 @@ static int luacall_rawsend(lua_State *L)
 	uint32_t fwmark;
 	sockaddr_in46 sa;
 	bool b;
+	t_lua_desync_context *ctx = NULL;
+	t_ctrack *track = NULL;
+
+	if (params.ref_desync_ctx) {
+		lua_rawgeti(L, LUA_REGISTRYINDEX, params.ref_desync_ctx);
+		ctx = (t_lua_desync_context *)lua_touserdata(L, -1);
+		lua_pop(L, 1);
+		if (ctx && ctx->valid) track = ctx->ctrack;
+	}
 
 	data=(uint8_t*)lua_reqlstring(L,1,&len);
 	lua_rawsend_extract_options(L,2,&repeats,&fwmark,&ifout);
@@ -3020,7 +3029,14 @@ static int luacall_rawsend(lua_State *L)
 		luaL_error(L, "bad ip4/ip6 header");
 	DLOG("rawsend repeats=%d size=%zu ifout=%s fwmark=%08X\n", repeats,len,ifout ? ifout : "",fwmark);
 
-	b = rawsend_rep(repeats, (struct sockaddr*)&sa, fwmark, ifout, data, len);
+	b = true;
+	for (int i = 0; i < repeats; i++) {
+		if (!rawsend((struct sockaddr*)&sa, fwmark, ifout, data, len)) {
+			b = false;
+			break;
+		}
+		ConntrackAdaptiveRecordInjection(track, 1, len);
+	}
 	lua_pushboolean(L, b);
 
 	LUA_STACK_GUARD_RETURN(L,1)
@@ -3039,8 +3055,17 @@ static int luacall_rawsend_dissect(lua_State *L)
 	uint32_t fwmark;
 	sockaddr_in46 sa;
 	bool b, badsum, keepsum, ip6_preserve_next;
+	t_lua_desync_context *ctx = NULL;
+	t_ctrack *track = NULL;
 	uint8_t last_proto;
 	uint8_t buf[RECONSTRUCT_MAX_SIZE] __attribute__((aligned(16)));
+
+	if (params.ref_desync_ctx) {
+		lua_rawgeti(L, LUA_REGISTRYINDEX, params.ref_desync_ctx);
+		ctx = (t_lua_desync_context *)lua_touserdata(L, -1);
+		lua_pop(L, 1);
+		if (ctx && ctx->valid) track = ctx->ctrack;
+	}
 
 	luaL_checktype(L,1,LUA_TTABLE);
 	lua_rawsend_extract_options(L,2, &repeats, &fwmark, &ifout);
@@ -3053,7 +3078,14 @@ static int luacall_rawsend_dissect(lua_State *L)
 	if (!extract_dst(buf, len, (struct sockaddr*)&sa))
 		luaL_error(L, "bad ip4/ip6 header");
 	DLOG("rawsend_dissect repeats=%d size=%zu badsum=%u ifout=%s fwmark=%08X\n", repeats,len,badsum,ifout ? ifout : "",fwmark);
-	b = rawsend_rep(repeats, (struct sockaddr*)&sa, fwmark, ifout, buf, len);
+	b = true;
+	for (int i = 0; i < repeats; i++) {
+		if (!rawsend((struct sockaddr*)&sa, fwmark, ifout, buf, len)) {
+			b = false;
+			break;
+		}
+		ConntrackAdaptiveRecordInjection(track, 1, len);
+	}
 	lua_pushboolean(L, b);
 
 	LUA_STACK_GUARD_RETURN(L,1)
