@@ -492,7 +492,7 @@ static int adaptive_control_existing(const char *path, const struct stat *existi
 	strcpy(local.sun_path, probe_path);
 	if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) goto done;
 	if (lstat(probe_path, &probe_stat) != 0 || !S_ISSOCK(probe_stat.st_mode) ||
-		probe_stat.st_uid != geteuid() || chmod(probe_path, 0600) != 0) goto done;
+		probe_stat.st_uid != geteuid() || chmod(probe_path, 0222) != 0) goto done;
 	memset(&remote, 0, sizeof(remote));
 	remote.sun_family = AF_UNIX;
 	if (snprintf(remote.sun_path, sizeof(remote.sun_path), "%s", path) >=
