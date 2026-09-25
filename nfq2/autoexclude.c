@@ -1106,10 +1106,13 @@ static void ae_flow_succeeded(const char *hostname)
 	{
 		if (h->fail_count)
 		{
-			ae_bus_emit(h->host, "AE_SUCCESS", "context=fail_counter_reset l7=%s", ae_l7_str(h->last_fail_l7));
-			h->fail_count = 0;
-			h->fail_head = 0;
-			ae_logev("%s : flow succeeded with tampering : fail counter reset", h->host);
+			// one success outweighs exactly one fail, not the whole
+			// observation : mixed fail/success bursts must still accumulate
+			// net evidence instead of endlessly resetting each other
+			h->fail_count--;
+			ae_logev("%s : flow succeeded with tampering : fail count %u", h->host, h->fail_count);
+			ae_bus_emit(h->host, "AE_SUCCESS", "context=fail_count_decrement l7=%s left=%u",
+				ae_l7_str(h->last_fail_l7), h->fail_count);
 		}
 	}
 	else if (h->state == AE_ST_PROBE && h->phase == AE_PH_REATTACK)
@@ -1251,13 +1254,14 @@ static void ae_save_state(void)
 	}
 
 	// durable state sidecar : host \t state \t n_exclusions \t exclude_until \t next_ttl \t l7
+	// state 5 marks a force_attack override (loaded back as clean+override)
 	used = (size_t)snprintf(buf, size,
 		"# autoexclude state (managed by nfqws2). host\\tstate\\tn_exclusions\\texclude_until\\tnext_ttl\n");
 	HASH_ITER(hh, ae_hosts, h, tmp)
 	{
-		if (h->state == AE_ST_CLEAN && !h->n_exclusions) continue;
+		if (h->state == AE_ST_CLEAN && !h->n_exclusions && !h->force_attack) continue;
 		w = snprintf(buf + used, size - used, "%s\t%u\t%u\t%lld\t%u\t%u\t%u\n",
-			h->host, h->state, h->n_exclusions, (long long)h->exclude_until, h->next_ttl,
+			h->host, h->force_attack ? 5 : h->state, h->n_exclusions, (long long)h->exclude_until, h->next_ttl,
 			h->l7_seen_tls ? 1 : 0, h->l7_seen_http ? 1 : 0);
 		if (w < 0 || (size_t)w >= size - used) break;
 		used += (size_t)w;
@@ -1352,15 +1356,27 @@ static void ae_state_line_cb(const char *line, void *ctx)
 	unsigned state, nexcl, next_ttl, tls, http;
 	long long until;
 	ae_host *h;
+	bool bforce_attack;
 
 	if (sscanf(line, "%255s %u %u %lld %u %u %u", host, &state, &nexcl, &until, &next_ttl, &tls, &http) < 5) return;
-	if (state > AE_ST_NOTCAND) return;
-	h = ae_find(host);
+	bforce_attack = state == 5;
+	if (bforce_attack)
+	{
+		// force_attack override : clean + not tracked, shadows a pass-only parent
+		state = AE_ST_CLEAN;
+	}
+	else if (state > AE_ST_NOTCAND) return;
+	// exact match is critical here : a subdomain row must update its own
+	// entry, never land on an already loaded parent (else subdomain rows
+	// would silently overwrite the parent ladder/flags depending on file
+	// order)
+	h = ae_find_exact(host);
 	if (!h && !(h = ae_add(host))) return;
 	h->n_exclusions = nexcl;
 	h->next_ttl = next_ttl;
 	h->l7_seen_tls = !!tls;
 	h->l7_seen_http = !!http;
+	h->force_attack = bforce_attack || h->force_attack;
 	h->t_last_activity = c->now;
 	c->bHaveState = true;
 
@@ -1416,17 +1432,18 @@ typedef struct ae_strset {
 	UT_hash_handle hh;
 } ae_strset;
 
-// hosts adopted by the external controller :
+// hosts adopted by the external controller or force-attacked by the owner :
 // the engine suspends tracking and verdicts for them, but keeps the entry and
-// the ttl-ladder history durable (the custody flag itself is re-asserted by
-// the controller through the control file after a daemon restart)
+// the ttl-ladder history durable (state file row survives; the custody flags
+// themselves are re-asserted by the controller through the control file after
+// a daemon restart, force_attack is persisted in the state file)
 static bool ae_adopted_match(const char *hostname)
 {
 	ae_host *h;
 
 	if (!params.ae_inited || !hostname) return false;
 	h = ae_find(hostname);
-	return h && h->adopted;
+	return h && (h->adopted || h->force_attack);
 }
 
 static void ae_list_presence_cb(const char *line, void *ctx)
@@ -1521,6 +1538,12 @@ static void ae_list_check(void)
 //   adopt <host>                controller takes custody : the engine
 //                               forgets the host, traffic processing stays
 //   release-adopt <host>        engine tracking resumes
+//   attack <host>               owner override : this exact host must stay
+//                               attacked even when its parent domain is
+//                               pass-only (own entry shadows the parent).
+//                               engine does not track it. survives restarts
+//   release-attack <host>       drop the override
+// exclude/release walk up to the parent domain, adopt/attack address the
 // exact hostname only. the file is DESIRED STATE : the whole file is
 // re-executed on every mtime change (and after a daemon restart), commands
 // are idempotent, the last command per host wins. keep the file
@@ -1664,6 +1687,60 @@ static void ae_control_release_adopt(const char *host)
 	}
 }
 
+static void ae_control_attack(const char *host)
+{
+	ae_host *h;
+
+	if (ae_manual_match(host))
+	{
+		ae_logev("%s : control attack ignored : manual list host", host);
+		ae_bus_emit(host, "AE_CONTROL", "cmd=attack host=%s result=manual_list", host);
+		return;
+	}
+	// the entry must be the exact host so it shadows any pass-only parent
+	// in ae_find (exact match is checked first)
+	h = ae_find_exact(host);
+	if (!h && !(h = ae_add(host))) return;
+#ifdef AE_CAN_FORK
+	if (ae_child.active && !strcmp(ae_child.host, h->host))
+	{
+		kill(ae_child.pid, SIGKILL);
+		waitpid(ae_child.pid, NULL, 0);
+		ae_child_close();
+	}
+#endif
+	if (ae_host_pass_only(h))
+	{
+		h->fail_count = 0;
+		h->fail_head = 0;
+		ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
+	}
+	h->force_attack = true;
+	h->t_last_activity = time(NULL);
+	ae_dirty_state = true;
+	ae_logev("%s : control attack : stays attacked (overrides parent pass-only), engine suspends tracking", h->host);
+	ae_bus_emit(h->host, "AE_CONTROL", "cmd=attack host=%s result=ok", h->host);
+}
+
+static void ae_control_release_attack(const char *host)
+{
+	ae_host *h = ae_find_exact(host);
+
+	if (h && h->force_attack)
+	{
+		h->force_attack = false;
+		h->t_last_activity = time(NULL);
+		ae_dirty_state = true;
+		ae_logev("%s : control release-attack : engine tracking resumed", h->host);
+		ae_bus_emit(h->host, "AE_CONTROL", "cmd=release-attack host=%s result=ok", h->host);
+	}
+	else
+	{
+		ae_logev("%s : control release-attack : host was not attacked-by-override", host);
+		ae_bus_emit(host, "AE_CONTROL", "cmd=release-attack host=%s result=not_attacked", host);
+	}
+}
+
 static void ae_control_line_cb(const char *line, void *ctx)
 {
 	char cmd[32], host[AE_HOST_LEN_MAX + 1], arg[64];
@@ -1678,7 +1755,9 @@ static void ae_control_line_cb(const char *line, void *ctx)
 	if (n >= 3) ae_lowercase(arg);
 	if (!strcmp(cmd, "exclude")) ae_control_exclude(host, n >= 3 ? arg : NULL);
 	else if (!strcmp(cmd, "release-adopt")) ae_control_release_adopt(host);
+	else if (!strcmp(cmd, "release-attack")) ae_control_release_attack(host);
 	else if (!strcmp(cmd, "release")) ae_control_release(host);
+	else if (!strcmp(cmd, "attack")) ae_control_attack(host);
 	else if (!strcmp(cmd, "adopt")) ae_control_adopt(host);
 	else ae_logev("control : unknown command '%s'", cmd);
 }
@@ -1729,13 +1808,84 @@ static bool ae_copy_file(const char *src, const char *dst)
 	return b;
 }
 
-// flash mirror : the working state lives in tmpfs and dies on reboot. chronic
-// exclusions are worth surviving it, so both files are copied to flash at a
-// low fixed cadence and only when they actually changed
+// flash mirror : the working state lives in tmpfs and dies on reboot. only
+// PERMANENT knowledge is worth the flash : chronic/permanent exclusions and
+// the ttl-ladder memory. temporary (ttl-based) exclusions are re-earned by
+// the engine after a reboot through the reduced recidive threshold, so the
+// mirror never contains them and temporary churn never touches flash
 static void ae_mirror_paths(char *lbuf, size_t lsize, char *sbuf, size_t ssize)
 {
 	snprintf(lbuf, lsize, "%s", params.autoexclude_mirror_file);
 	snprintf(sbuf, ssize, "%s.state", params.autoexclude_mirror_file);
+}
+
+// true when the file content is byte-identical (avoids pointless flash writes
+// when the live view changed but the permanent view did not)
+static bool ae_file_equals(const char *path, const char *content, size_t len)
+{
+	FILE *F;
+	char *buf;
+	long sz;
+	size_t rd;
+	bool b = false;
+
+	F = fopen(path, "rb");
+	if (!F) return false;
+	if (fseek(F, 0, SEEK_END) || (sz = ftell(F)) < 0 || (size_t)sz != len) { fclose(F); return false; }
+	if (fseek(F, 0, SEEK_SET)) { fclose(F); return false; }
+	if (!(buf = malloc(len ? len : 1))) { fclose(F); return false; }
+	rd = fread(buf, 1, len, F);
+	fclose(F);
+	b = rd == len && !memcmp(buf, content, len);
+	free(buf);
+	return b;
+}
+
+// build the mirror content. list : permanent pass-only hosts only.
+// state : ladder memory with ttl-based exclusions demoted to clean and
+// force_attack overrides kept (state code 5)
+static size_t ae_mirror_content(char *buf, size_t size, bool bList)
+{
+	ae_host *h, *tmp;
+	size_t used = 0;
+	int w;
+
+	if (bList)
+	{
+		used = (size_t)snprintf(buf, size,
+			"# autoexclude : PERMANENT exclusions (flash mirror of the tmpfs working set)\n"
+			"# temporary (ttl) exclusions are deliberately not mirrored : the engine\n"
+			"# re-earns them after a reboot via the recidive threshold\n");
+		HASH_ITER(hh, ae_hosts, h, tmp)
+		{
+			if (!ae_host_pass_only(h) || h->exclude_until) continue;
+			w = snprintf(buf + used, size - used, "%s\n", h->host);
+			if (w < 0 || (size_t)w >= size - used) break;
+			used += (size_t)w;
+		}
+	}
+	else
+	{
+		used = (size_t)snprintf(buf, size,
+			"# autoexclude state mirror. host\\tstate\\tn_exclusions\\texclude_until\\tnext_ttl\n");
+		HASH_ITER(hh, ae_hosts, h, tmp)
+		{
+			uint8_t mstate = h->state;
+			if (h->force_attack) mstate = 5;
+			else if (h->state == AE_ST_EXCLUDED && h->exclude_until)
+				mstate = AE_ST_CLEAN; // temporary exclusion : keep the ladder, drop the ttl
+			else if (h->state == AE_ST_PROBE || h->state == AE_ST_COLLECT)
+				mstate = AE_ST_CLEAN; // volatile runtime phases carry no durable value
+			if (mstate == AE_ST_CLEAN && !h->n_exclusions) continue;
+			w = snprintf(buf + used, size - used, "%s\t%u\t%u\t%lld\t%u\t%u\t%u\t%u\n",
+				h->host, mstate, h->n_exclusions,
+				(long long)(mstate == AE_ST_EXCLUDED ? h->exclude_until : 0), h->next_ttl,
+				h->l7_seen_tls ? 1 : 0, h->l7_seen_http ? 1 : 0, h->n_strong);
+			if (w < 0 || (size_t)w >= size - used) break;
+			used += (size_t)w;
+		}
+	}
+	return used;
 }
 
 static void ae_mirror_update(bool bForce)
@@ -1745,6 +1895,7 @@ static void ae_mirror_update(bool bForce)
 	bool bl, bs, bchanged = false;
 	static time_t t_last_err;
 	char mlbuf[PATH_MAX + 8], msbuf[PATH_MAX + 8];
+	char *lbuf, *sbuf;
 
 	if (!*params.autoexclude_mirror_file) return;
 	if (!bForce && now - ae_last_mirror < params.autoexclude_mirror_interval) return;
@@ -1758,19 +1909,47 @@ static void ae_mirror_update(bool bForce)
 	    (!bs || !memcmp(&ss, &ae_mirror_sig_state, sizeof(ss))))
 		return;
 
+	// the live view changed : regenerate the PERMANENT view and write only
+	// the files whose permanent content actually differs
+	if (!(lbuf = malloc(16 * 1024)) || !(sbuf = malloc(16 * 1024)))
+	{
+		free(lbuf);
+		return;
+	}
 	ae_mirror_paths(mlbuf, sizeof(mlbuf), msbuf, sizeof(msbuf));
 	if (bl && memcmp(&sl, &ae_mirror_sig_list, sizeof(sl)))
-		if (ae_copy_file(params.autoexclude_file, mlbuf)) { ae_mirror_sig_list = sl; bchanged = true; }
-	if (bs && memcmp(&ss, &ae_mirror_sig_state, sizeof(ss)))
-		if (ae_copy_file(params.autoexclude_state_file, msbuf)) { ae_mirror_sig_state = ss; bchanged = true; }
-
-	if (!bchanged && now - t_last_err >= 3600)
 	{
-		t_last_err = now;
-		DLOG_ERR("autoexclude : cannot write the flash mirror %s\n", mlbuf);
+		size_t n = ae_mirror_content(lbuf, 16 * 1024, true);
+		if (!ae_file_equals(mlbuf, lbuf, n))
+		{
+			if (ae_write_file(mlbuf, lbuf, n)) bchanged = true;
+			else if (now - t_last_err >= 3600)
+			{
+				t_last_err = now;
+				DLOG_ERR("autoexclude : cannot write the flash mirror %s\n", mlbuf);
+			}
+		}
+		ae_mirror_sig_list = sl;
 	}
-	else if (bchanged)
-		DLOG("autoexclude : flash mirror updated\n");
+	if (bs && memcmp(&ss, &ae_mirror_sig_state, sizeof(ss)))
+	{
+		size_t n = ae_mirror_content(sbuf, 16 * 1024, false);
+		if (!ae_file_equals(msbuf, sbuf, n))
+		{
+			if (ae_write_file(msbuf, sbuf, n)) bchanged = true;
+			else if (now - t_last_err >= 3600)
+			{
+				t_last_err = now;
+				DLOG_ERR("autoexclude : cannot write the flash mirror %s\n", msbuf);
+			}
+		}
+		ae_mirror_sig_state = ss;
+	}
+	free(lbuf);
+	free(sbuf);
+
+	if (bchanged)
+		DLOG("autoexclude : flash mirror updated (permanent view)\n");
 }
 
 // after a reboot the tmpfs files are empty : restore them from the mirror
@@ -2101,8 +2280,8 @@ void ae_timer(void)
 				ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
 			break;
 		case AE_ST_CLEAN:
-			// adopted entries keep their history indefinitely
-			if (!h->adopted && now - h->t_last_activity > AE_CLEAN_RETENTION)
+			// adopted/attacked-by-override entries keep their history indefinitely
+			if (!(h->adopted || h->force_attack) && now - h->t_last_activity > AE_CLEAN_RETENTION)
 				ae_del(h);
 			break;
 		}
