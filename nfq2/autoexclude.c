@@ -118,6 +118,7 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, 
 static void ae_flow_succeeded(const char *hostname);
 static void ae_probe_success(const char *hostname);
 static ae_host * ae_find(const char *hostname);
+static bool ae_adopted_match(const char *hostname);
 
 #ifdef AE_CAN_FORK
 static struct {
@@ -206,6 +207,22 @@ static ae_host * ae_find(const char *hostname)
 		p++;
 		if (!strchr(p, '.')) return NULL; // do not match bare TLD
 	}
+}
+
+// exact-hostname lookup, no parent-domain walk. used by the control channel
+// where the operator addresses one specific host (attack/adopt) and must not
+// land on the parent entry
+static ae_host * ae_find_exact(const char *hostname)
+{
+	char buf[AE_HOST_LEN_MAX + 1];
+	ae_host *h;
+	size_t l = strlen(hostname);
+
+	if (!l || l > AE_HOST_LEN_MAX) return NULL;
+	memcpy(buf, hostname, l + 1);
+	ae_lowercase(buf);
+	HASH_FIND(hh, ae_hosts, buf, l, h);
+	return h;
 }
 
 static bool ae_manual_match(const char *hostname)
@@ -963,6 +980,7 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, 
 
 	if (!params.ae_inited) return;
 	if (ae_manual_match(hostname)) return; // manual list always wins
+	if (ae_adopted_match(hostname)) return; // external controller owns this host
 
 	h = ae_find(hostname);
 	if (!h)
@@ -1398,6 +1416,19 @@ typedef struct ae_strset {
 	UT_hash_handle hh;
 } ae_strset;
 
+// hosts adopted by the external controller :
+// the engine suspends tracking and verdicts for them, but keeps the entry and
+// the ttl-ladder history durable (the custody flag itself is re-asserted by
+// the controller through the control file after a daemon restart)
+static bool ae_adopted_match(const char *hostname)
+{
+	ae_host *h;
+
+	if (!params.ae_inited || !hostname) return false;
+	h = ae_find(hostname);
+	return h && h->adopted;
+}
+
 static void ae_list_presence_cb(const char *line, void *ctx)
 {
 	ae_strset **pp = (ae_strset**)ctx;
@@ -1422,6 +1453,7 @@ static void ae_list_reload(void)
 	// lines added manually : exclude permanently
 	HASH_ITER(hh, present, s, stmp)
 	{
+		if (ae_adopted_match(s->str)) continue; // controller custody wins
 		h = ae_find(s->str);
 		if (!h)
 		{
@@ -1476,6 +1508,193 @@ static void ae_list_check(void)
 	if (!memcmp(&ms, &ae_list_modsig, sizeof(ms))) return;
 	ae_list_modsig = ms;
 	ae_list_reload();
+}
+
+// ---------------- external control channel ----------------
+
+// hot command file for the external controller, one command per line :
+//   exclude <host> [ttl|perm]   force pass-only for ttl seconds (default :
+//                               base ttl), perm = until released. resolves
+//                               to the parent domain entry when the exact
+//                               host is unknown (exclusion inherits down)
+//   release <host>              return the host to processing
+//   adopt <host>                controller takes custody : the engine
+//                               forgets the host, traffic processing stays
+//   release-adopt <host>        engine tracking resumes
+// exact hostname only. the file is DESIRED STATE : the whole file is
+// re-executed on every mtime change (and after a daemon restart), commands
+// are idempotent, the last command per host wins. keep the file
+// authoritative, rewrite atomically
+
+static char ae_control_file[PATH_MAX];
+// nanosecond mtime + size : a controller may rewrite the file twice within
+// one second, seconds-granularity mtime would miss it
+static struct {
+	time_t sec;
+	long nsec;
+	off_t size;
+} ae_control_sig;
+
+static void ae_control_exclude(const char *host, const char *arg)
+{
+	ae_host *h;
+	uint32_t ttl = (uint32_t)params.autoexclude_ttl;
+
+	if (ae_manual_match(host))
+	{
+		ae_logev("%s : control exclude ignored : manual list host", host);
+		ae_bus_emit(host, "AE_CONTROL", "cmd=exclude host=%s result=manual_list", host);
+		return;
+	}
+	if (arg)
+	{
+		if (!strcmp(arg, "perm") || !strcmp(arg, "permanent")) ttl = 0;
+		else
+		{
+			ttl = (uint32_t)strtoul(arg, NULL, 10);
+			if (!ttl) ttl = (uint32_t)params.autoexclude_ttl;
+		}
+	}
+	h = ae_find(host);
+	if (!h && !(h = ae_add(host))) return;
+#ifdef AE_CAN_FORK
+	if (ae_child.active && !strcmp(ae_child.host, h->host))
+	{
+		kill(ae_child.pid, SIGKILL);
+		waitpid(ae_child.pid, NULL, 0);
+		ae_child_close();
+		h->probe_attempts = 0;
+	}
+#endif
+	h->fail_count = 0;
+	h->fail_head = 0;
+	h->exclude_until = ttl ? time(NULL) + ttl : 0;
+	ae_set_state(h, AE_ST_EXCLUDED, AE_PH_NONE);
+	ae_dirty_state = true;
+	if (ttl)
+	{
+		ae_logev("%s : control exclude : pass-only for %u s", h->host, ttl);
+		ae_bus_emit(h->host, "AE_CONTROL", "cmd=exclude host=%s ttl=%u", h->host, ttl);
+	}
+	else
+	{
+		ae_logev("%s : control exclude : pass-only permanent", h->host);
+		ae_bus_emit(h->host, "AE_CONTROL", "cmd=exclude host=%s ttl=permanent", h->host);
+	}
+}
+
+static void ae_control_release(const char *host)
+{
+	ae_host *h = ae_find(host);
+
+	if (!h)
+	{
+		ae_logev("%s : control release : unknown host", host);
+		ae_bus_emit(host, "AE_CONTROL", "cmd=release host=%s result=unknown_host", host);
+		return;
+	}
+	// same transition as a manual line removal : history is kept
+#ifdef AE_CAN_FORK
+	if (ae_child.active && !strcmp(ae_child.host, h->host))
+	{
+		kill(ae_child.pid, SIGKILL);
+		waitpid(ae_child.pid, NULL, 0);
+		ae_child_close();
+		h->probe_attempts = 0;
+	}
+#endif
+	h->fail_count = 0;
+	h->fail_head = 0;
+	ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
+	ae_logev("%s : control release : returning to processing", h->host);
+	ae_bus_emit(h->host, "AE_CONTROL", "cmd=release host=%s result=ok", h->host);
+}
+
+static void ae_control_adopt(const char *host)
+{
+	ae_host *h;
+
+	if (ae_manual_match(host))
+	{
+		ae_logev("%s : control adopt ignored : manual list host", host);
+		ae_bus_emit(host, "AE_CONTROL", "cmd=adopt host=%s result=manual_list", host);
+		return;
+	}
+	// exact-host semantics : adopting must never land on the parent entry
+	h = ae_find_exact(host);
+	if (!h && !(h = ae_add(host))) return;
+#ifdef AE_CAN_FORK
+	if (ae_child.active && !strcmp(ae_child.host, h->host))
+	{
+		kill(ae_child.pid, SIGKILL);
+		waitpid(ae_child.pid, NULL, 0);
+		ae_child_close();
+	}
+#endif
+	// handover : drop pass-only (the controller decides for itself), keep the
+	// exclusion-ladder history for when the custody is released
+	if (ae_host_pass_only(h))
+	{
+		h->fail_count = 0;
+		h->fail_head = 0;
+		ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
+	}
+	h->adopted = true;
+	ae_dirty_state = true;
+	ae_logev("%s : control adopt : external controller owns this host, engine suspends tracking", h->host);
+	ae_bus_emit(h->host, "AE_CONTROL", "cmd=adopt host=%s result=ok", h->host);
+}
+
+static void ae_control_release_adopt(const char *host)
+{
+	ae_host *h = ae_find_exact(host);
+
+	if (h && h->adopted)
+	{
+		h->adopted = false;
+		h->t_last_activity = time(NULL);
+		ae_dirty_state = true;
+		ae_logev("%s : control release-adopt : engine tracking resumed", h->host);
+		ae_bus_emit(h->host, "AE_CONTROL", "cmd=release-adopt host=%s result=ok", h->host);
+	}
+	else
+	{
+		ae_logev("%s : control release-adopt : host was not adopted", host);
+		ae_bus_emit(host, "AE_CONTROL", "cmd=release-adopt host=%s result=not_adopted", host);
+	}
+}
+
+static void ae_control_line_cb(const char *line, void *ctx)
+{
+	char cmd[32], host[AE_HOST_LEN_MAX + 1], arg[64];
+	int n;
+
+	(void)ctx;
+	arg[0] = 0;
+	n = sscanf(line, "%31s %255s %63s", cmd, host, arg);
+	if (n < 2) return;
+	ae_lowercase(cmd);
+	ae_lowercase(host);
+	if (n >= 3) ae_lowercase(arg);
+	if (!strcmp(cmd, "exclude")) ae_control_exclude(host, n >= 3 ? arg : NULL);
+	else if (!strcmp(cmd, "release-adopt")) ae_control_release_adopt(host);
+	else if (!strcmp(cmd, "release")) ae_control_release(host);
+	else if (!strcmp(cmd, "adopt")) ae_control_adopt(host);
+	else ae_logev("control : unknown command '%s'", cmd);
+}
+
+static void ae_control_check(void)
+{
+	struct stat st;
+
+	if (!*ae_control_file) return;
+	if (stat(ae_control_file, &st)) return;
+	if (st.st_mtim.tv_sec == ae_control_sig.sec && st.st_mtim.tv_nsec == ae_control_sig.nsec &&
+		st.st_size == ae_control_sig.size) return;
+	ae_control_sig.sec = st.st_mtim.tv_sec;
+	ae_control_sig.nsec = st.st_mtim.tv_nsec;
+	ae_control_sig.size = st.st_size;
+	ae_file_read_lines(ae_control_file, ae_control_line_cb, NULL);
 }
 
 static bool ae_copy_file(const char *src, const char *dst)
@@ -1581,6 +1800,10 @@ static void ae_state_path(void)
 {
 	const char *base, *p;
 
+	// control channel : fixed path in tmpfs, hot-polled by mtime. inert
+	// while the file does not exist
+	snprintf(ae_control_file, sizeof(ae_control_file), "/tmp/nfqws2_ae_control");
+
 	if (*params.autoexclude_state_file) return;
 	if (!strncmp(params.autoexclude_file, "/tmp/", 5))
 	{
@@ -1675,6 +1898,10 @@ void ae_init(void)
 	file_mod_signature(params.autoexclude_state_file, &ae_mirror_sig_state);
 	ae_last_mirror = 0; // mirror as soon as anything changes
 
+	// control channel starts with a clean signature : a pre-existing file
+	// (controller was here before us) is executed on the first tick
+	memset(&ae_control_sig, -1, sizeof(ae_control_sig));
+
 #ifdef AE_CAN_FORK
 	ae_child.fd = -1;
 #endif
@@ -1749,6 +1976,7 @@ void ae_timer(void)
 	ae_scan_conntrack(boottime());
 	ae_manual_reload(false);
 	ae_list_check();
+	ae_control_check();
 	ae_mirror_update(false);
 
 	// drop stale ip bindings
@@ -1873,7 +2101,8 @@ void ae_timer(void)
 				ae_set_state(h, AE_ST_CLEAN, AE_PH_NONE);
 			break;
 		case AE_ST_CLEAN:
-			if (now - h->t_last_activity > AE_CLEAN_RETENTION)
+			// adopted entries keep their history indefinitely
+			if (!h->adopted && now - h->t_last_activity > AE_CLEAN_RETENTION)
 				ae_del(h);
 			break;
 		}
