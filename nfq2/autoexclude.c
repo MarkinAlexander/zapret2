@@ -50,6 +50,9 @@ typedef struct ae_host {
 	uint8_t probe_attempts;	// active probe retry counter within current phase
 	uint8_t po_attempts;	// pass-only client attempts observed in this probe
 	uint8_t po_rst;		// early RSTs seen on pass-only attempts (provider block)
+	uint64_t po_bytes;	// cumulative pass-only server bytes in this probe : the direct-access
+				// volume proof. single short flows prove nothing, dpi feeds the first
+				// kilobytes of a blocked connection before dropping it
 	bool l7_seen_tls, l7_seen_http; // protocols seen on attributed flows. picks the probe scheme
 	time_t ok_times[3][4];	// recent attack-success timestamps per l7 (0=tls,1=http,2=other)
 	uint8_t ok_head[3];
@@ -126,6 +129,7 @@ static time_t ae_last_mirror;
 
 static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, const t_ctrack *ctrack);
 static void ae_flow_succeeded(const char *hostname);
+static void ae_probe_note_bytes(const char *hostname, size_t len);
 static void ae_probe_success(const char *hostname);
 static ae_host * ae_find(const char *hostname);
 static bool ae_adopted_match(const char *hostname);
@@ -140,6 +144,7 @@ static struct {
 	bool recheck;			// this probe is a periodic recheck of an excluded host
 	char host[AE_HOST_LEN_MAX + 1];
 	time_t deadline;
+	uint64_t size_dl;	// bytes actually downloaded by the probe
 } ae_child;
 #endif
 
@@ -546,7 +551,7 @@ static bool ae_probe_spawn(ae_host *h, uint8_t phase)
 			argv[argc++] = (char*)"1.2";
 		}
 		argv[argc++] = (char*)"-w";
-		argv[argc++] = (char*)"%{http_code}";
+		argv[argc++] = (char*)"%{http_code} %{size_download}";
 		argv[argc++] = url;
 		argv[argc] = NULL;
 		execv(params.autoexclude_curl, argv);
@@ -727,8 +732,10 @@ static void ae_child_dispatch(bool bok, bool binconclusive)
 		{
 			h->deadline = time(NULL) + params.autoexclude_reattack_window;
 			ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
-			ae_logev("%s : probe B1 ok (works without tampering), re-attacking for %d s", h->host, params.autoexclude_reattack_window);
-			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=ok");
+			ae_logev("%s : probe B1 ok (works without tampering, %llu bytes), re-attacking for %d s",
+				h->host, (unsigned long long)ae_child.size_dl, params.autoexclude_reattack_window);
+			ae_bus_emit(h->host, "AE_PROBE_B1", "source=curl result=ok bytes=%llu",
+				(unsigned long long)ae_child.size_dl);
 			h->probe_weak = false; // the probe itself opened the site : strong proof
 		}
 		else
@@ -778,7 +785,9 @@ static void ae_child_reap(time_t now)
 {
 	int status;
 	pid_t r;
-	char buf[64], code[8];
+	char buf[64], code[8], size[24];
+	char out[256];
+	size_t outlen = 0;
 	ssize_t rd;
 	bool bok = false, binconclusive = false;
 	int exitcode;
@@ -803,29 +812,54 @@ static void ae_child_reap(time_t now)
 		return;
 	}
 
-	// curl writes only %{http_code} to stdout. keep the last printable token
-	code[0] = 0;
+	// curl writes "%{http_code} %{size_download}" to stdout : keep a printable
+	// tail and take the last two tokens. dpi routinely answers with a status
+	// and the first kilobytes of a blocked connection before dropping it, so a
+	// status alone proves nothing : require real transfer volume as well
 	for (;;)
 	{
 		rd = read(ae_child.fd, buf, sizeof(buf));
 		if (rd <= 0) break;
-		size_t len = (size_t)rd, start = len;
-		while (start > 0 && isprint((unsigned char)buf[start-1])) start--;
-		if (len - start)
+		for (ssize_t k = 0; k < rd; k++)
 		{
-			size_t cl = len - start;
-			if (cl > sizeof(code)-1) cl = sizeof(code)-1;
-			memcpy(code, buf + start, cl);
-			code[cl] = 0;
+			char c = (char)buf[k];
+			if (c == '\n' || c == '\r') c = ' ';
+			if (outlen < sizeof(out)-1 && (isprint((unsigned char)c) || c == ' '))
+				out[outlen++] = c;
 		}
 	}
-
+	out[outlen] = 0;
+	{
+		char *end = out + outlen;
+		while (end > out && end[-1] == ' ') end--;
+		*end = 0;
+		char *sp = end - 1;
+		while (sp > out && *sp != ' ') sp--;
+		if (sp > out)
+		{
+			char *sizep = sp + 1;
+			*sp = 0;
+			snprintf(size, sizeof(size), "%s", sizep);
+			char *cp = sp - 1;
+			while (cp > out && *cp != ' ') cp--;
+			snprintf(code, sizeof(code), "%s", *cp == ' ' ? cp + 1 : cp);
+		}
+	}
 	exitcode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 	if (exitcode == 127)
 		binconclusive = true;
 	else
-		// success = curl completed and got any http status (1xx..5xx)
-		bok = exitcode == 0 && code[0] >= '1' && code[0] <= '5';
+	{
+		ae_child.size_dl = strtoull(size, NULL, 10);
+		bool size_ok = !params.autoexclude_b1_bytes ||
+			ae_child.size_dl >= (uint64_t)params.autoexclude_b1_bytes;
+		// success = curl completed, got any http status (1xx..5xx) and moved at
+		// least b1_bytes of real payload (0 disables the volume requirement)
+		bok = exitcode == 0 && code[0] >= '1' && code[0] <= '5' && size_ok;
+		if (exitcode == 0 && code[0] >= '1' && code[0] <= '5' && !size_ok)
+			ae_logev("%s : probe got http %s but only %s bytes (need %d) : not a proof",
+				ae_child.host, code, size, params.autoexclude_b1_bytes);
+	}
 	ae_child_dispatch(bok, binconclusive);
 }
 
@@ -993,6 +1027,10 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 				return;
 			}
 		}
+		// b1 volume proof : every pass-only server byte counts toward the
+		// direct-access threshold before any success is declared
+		if (!ctrack->ae_attacked && dis->len_payload && !bRST)
+			ae_probe_note_bytes(ctrack->hostname, dis->len_payload);
 		// real server data (not RST, not garbage) means the flow works. require
 		// a meaningful cumulative amount : dpi-injected fake server hellos are
 		// small, and until this threshold the flow stays undecided so later
@@ -1012,6 +1050,8 @@ void ae_hook_incoming(t_ctrack *ctrack, const struct dissect *dis, const struct 
 	}
 		else if (dis->proto == IPPROTO_UDP && dis->len_payload)
 		{
+			if (!ctrack->ae_attacked)
+				ae_probe_note_bytes(ctrack->hostname, dis->len_payload);
 			if (ctrack->pos.server.pbcounter + dis->len_payload >= AE_SUCCESS_BYTES)
 		{
 			if (ctrack->ae_attacked && !ctrack->ae_finalized)
@@ -1167,6 +1207,7 @@ static void ae_flow_failed(const char *hostname, const char *reason, int l7idx, 
 			h->po_attempts = 0;
 			h->po_rst = 0;
 			h->probe_weak = false;
+			h->po_bytes = 0;
 		}
 		break;
 	case AE_ST_PROBE:
@@ -1224,6 +1265,11 @@ static void ae_flow_succeeded(const char *hostname)
 	h = ae_find(hostname);
 	if (!h) return;
 	h->t_last_activity = time(NULL);
+	// volume proof (ct12) : a single short flow must not vouch for the direct path.
+	// dpi routinely lets the first kilobytes of a blocked connection through
+	// before dropping it, so require the accumulated pass-only traffic to cross
+	// the threshold before any B1 success is declared
+	if (h->po_bytes < (uint64_t)params.autoexclude_b1_bytes) return;
 
 	if (h->state == AE_ST_COLLECT)
 	{
@@ -1252,6 +1298,20 @@ static void ae_flow_succeeded(const char *hostname)
 		ae_bus_emit(h->host, "AE_SUCCESS", "context=reattack l7=%s", ae_l7_str(h->last_fail_l7));
 		ae_verdict_transient(h, "client success under re-attack");
 	}
+}
+
+// b1 volume ledger : accumulate every pass-only server byte while the host is
+	// in the B1 window. the threshold check happens in ae_probe_success
+static void ae_probe_note_bytes(const char *hostname, size_t len)
+{
+	ae_host *h;
+
+	if (!params.ae_inited || !len) return;
+	h = ae_find(hostname);
+	if (!h) return;
+	if (h->state != AE_ST_PROBE) return;
+	if (h->phase != AE_PH_PASSIVE_WAIT && h->phase != AE_PH_CURL_B1) return;
+	h->po_bytes += (uint64_t)len;
 }
 
 static void ae_probe_success(const char *hostname)
@@ -1298,8 +1358,9 @@ static void ae_probe_success(const char *hostname)
 #endif
 		h->deadline = time(NULL) + params.autoexclude_reattack_window;
 		ae_set_state(h, AE_ST_PROBE, AE_PH_REATTACK);
-		ae_logev("%s : client success in pass-only window (B1), re-attacking for %d s", h->host, params.autoexclude_reattack_window);
-		ae_bus_emit(h->host, "AE_PROBE_B1", "source=client result=ok");
+		ae_logev("%s : client success in pass-only window (B1), %llu direct bytes, re-attacking for %d s",
+				h->host, (unsigned long long)h->po_bytes, params.autoexclude_reattack_window);
+		ae_bus_emit(h->host, "AE_PROBE_B1", "source=client result=ok bytes=%llu", (unsigned long long)h->po_bytes);
 		h->probe_weak = false; // real data reached the client : strong proof
 	}
 	// other states : no event

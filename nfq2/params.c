@@ -9,6 +9,7 @@
 
 #include "pools.h"
 #include "lua.h"
+#include "debug_hosts.h"
 
 #ifdef BSD
 const char *progname = "dvtws2";
@@ -187,6 +188,20 @@ static int DLOG_VA(const char *format, int syslog_priority, bool condup, va_list
 		va_copy(args2,args);
 		DLOG_CON_VA(format,syslog_priority,args2);
 		va_end(args2);
+	}
+	// per-domain debug : armed by the debug-hosts file, no --debug needed.
+	// only lines attributed to a matching flow host go to the output file,
+	// everything else is suppressed. DLOG_ERR already reached the console above
+	if (dbg_hosts_armed())
+	{
+		if (dbg_hosts_context_match())
+		{
+			va_copy(args2,args);
+			dbg_hosts_log_va(format,args2);
+			va_end(args2);
+			r = 1;
+		}
+		return r;
 	}
 	if (params.debug)
 	{
@@ -596,6 +611,8 @@ void init_params(struct params_s *params)
 	snprintf(params->autoexclude_manual_file, sizeof(params->autoexclude_manual_file), "%s", AE_MANUAL_FILE_DEFAULT);
 	snprintf(params->autoexclude_veto_file, sizeof(params->autoexclude_veto_file), "%s", AE_VETO_FILE_DEFAULT);
 	params->autoexclude_recheck_interval = AE_RECHECK_INTERVAL_DEFAULT;
+	params->autoexclude_b1_bytes = AE_B1_BYTES_DEFAULT;
+	snprintf(params->debug_hosts_file, sizeof(params->debug_hosts_file), "%s", DEBUG_HOSTS_FILE_DEFAULT);
 	snprintf(params->autoexclude_curl, sizeof(params->autoexclude_curl), "%s", AE_CURL_DEFAULT);
 	// event log is on by default : /tmp is writable by the daemon user and
 	// survives nothing (tmpfs), which is fine for an observability log

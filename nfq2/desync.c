@@ -11,6 +11,7 @@
 #include "ipset.h"
 #include "conntrack.h"
 #include "autoexclude.h"
+#include "debug_hosts.h"
 #include "lua.h"
 
 #define PKTDATA_MAXDUMP 32
@@ -1336,6 +1337,7 @@ static bool play_prolog(
 		if (ps->ssid) DLOG("found ssid for %s : %s\n", ifname, ps->ssid);
 #endif
 		ps->l7proto = ps->ctrack_replay->l7proto;
+		dbg_hosts_set_context(ps->ctrack_replay ? ps->ctrack_replay->hostname : NULL);
 		ps->dp = ps->ctrack_replay->dp;
 		if (ps->dp)
 			DLOG("using cached desync profile %u (%s)\n", ps->dp->n, PROFILE_NAME(ps->dp));
@@ -1363,6 +1365,7 @@ static bool play_prolog(
 				ps->ctrack_replay = ps->ctrack;
 			}
 		}
+		if (ps->ctrack) dbg_hosts_set_context(ps->ctrack->hostname);
 		// in absence of conntrack guess direction by presence of interface names. won't work on BSD
 		ps->bReverseFixed = ps->ctrack ? (ps->bReverse ^ params.server) : (ps->bReverse = ifin && *ifin && (!ifout || !*ifout));
 		setup_direction(dis, ps->bReverseFixed, &ps->src, &ps->dst, &ps->sdip4, &ps->sdip6, &ps->sdport);
@@ -2379,6 +2382,7 @@ static uint8_t dpi_desync_packet_play(
 {
 	struct dissect dis;
 	uint8_t verdict = VERDICT_PASS;
+	dbg_hosts_clear_context();
 
 	// NOTE ! OS can pass wrong checksum to queue. cannot rely on it !
 

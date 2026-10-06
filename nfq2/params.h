@@ -65,6 +65,13 @@
 #define AE_MIRROR_INTERVAL_DEFAULT	21600	// flash mirror cadence, seconds
 #define AE_VETO_FILE_DEFAULT		"/opt/zator/lists/netrogat-veto.txt"
 #define AE_RECHECK_INTERVAL_DEFAULT	21600	// recheck cadence for excluded hosts, seconds (0 = never)
+#define AE_B1_BYTES_DEFAULT		16384	// pass-only direct-access proof : cumulative server bytes.
+						// small amounts prove nothing, dpi routinely lets the first
+						// kilobytes of a blocked connection through before dropping
+
+#define DEBUG_HOSTS_FILE_DEFAULT	"/opt/zapret2/debug-hosts.txt"
+						// per-domain debug control file : hosts listed there get their
+						// DLOG into the output file named by the first '# /path' comment
 
 #define IPCACHE_LIFETIME		7200
 
@@ -220,6 +227,8 @@ struct params_s
 	int autoexclude_mirror_interval;
 	char autoexclude_veto_file[PATH_MAX]; // user-managed never-exclude hostlist
 	int autoexclude_recheck_interval; // periodic recheck of excluded hosts, seconds (0 = never)
+	int autoexclude_b1_bytes;	// cumulative pass-only server bytes required to vouch for the direct path
+	char debug_hosts_file[PATH_MAX]; // per-domain debug control file (hot reloaded)
 	bool autoexclude_passive;	// no active probing, passive differential only
 	bool ae_inited;		// runtime : ae_init succeeded
 

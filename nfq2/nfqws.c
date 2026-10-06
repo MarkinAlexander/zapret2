@@ -5,6 +5,7 @@
 #include "desync.h"
 #include "helpers.h"
 #include "autoexclude.h"
+#include "debug_hosts.h"
 #include "checksum.h"
 #include "params.h"
 #include "protocol.h"
@@ -2264,6 +2265,8 @@ static void exithelp(void)
 		" --autoexclude-veto-file=<filename>\t\t; user-managed never-exclude hostlist, hot reloaded (default : %s)\n"
 		" --autoexclude-recheck-interval=<int>\t\t; recheck excluded hosts this often, 0 = never (default : %d)\n"
 		" --autoexclude-max-hosts=<int>\t\t\t; max tracked hosts (default : %d)\n"
+		" --autoexclude-b1-bytes=<int>\t\t\t\t\t; pass-only direct-access proof volume, cumulative server bytes (default : %d)\n"
+		" --debug-hosts=<filename>\t\t\t\t; per-domain debug control file, read at startup, first # comment = output path (default : %s)\n"
 		" --autoexclude-mode=<hybrid|passive>\t\t; passive never sends probe traffic (default : hybrid)\n"
 		"\nLUA PACKET PASS MODE:\n"
 		" --payload=type[,type]\t\t\t\t\t; set payload types following LUA functions should process : %s\n"
@@ -2289,6 +2292,7 @@ static void exithelp(void)
 		AE_PROBE_MAXTIME_DEFAULT, AE_TTL_FIRST_DEFAULT, AE_TTL_DEFAULT,
 		AE_TTL_MAX_DEFAULT, AE_COOLDOWN_DEFAULT, AE_STICKY_AFTER_DEFAULT,
 		AE_MIRROR_FILE_DEFAULT, AE_MIRROR_INTERVAL_DEFAULT, AE_VETO_FILE_DEFAULT, AE_RECHECK_INTERVAL_DEFAULT, AE_MAX_HOSTS_DEFAULT,
+		AE_B1_BYTES_DEFAULT, DEBUG_HOSTS_FILE_DEFAULT,
 		all_payloads
 	);
 	close_std_and_exit(1);
@@ -2425,6 +2429,8 @@ enum opt_indices {
 	IDX_AUTOEXCLUDE_RECHECK_INTERVAL,
 	IDX_AUTOEXCLUDE_MAX_HOSTS,
 	IDX_AUTOEXCLUDE_MODE,
+	IDX_AUTOEXCLUDE_B1_BYTES,
+	IDX_DEBUG_HOSTS,
 	IDX_NEW,
 	IDX_SKIP,
 	IDX_NAME,
@@ -2567,6 +2573,8 @@ static const struct option long_options[] = {
 	[IDX_AUTOEXCLUDE_RECHECK_INTERVAL] = {"autoexclude-recheck-interval", required_argument, 0, 0},
 	[IDX_AUTOEXCLUDE_MAX_HOSTS] = {"autoexclude-max-hosts", required_argument, 0, 0},
 	[IDX_AUTOEXCLUDE_MODE] = {"autoexclude-mode", required_argument, 0, 0},
+	[IDX_AUTOEXCLUDE_B1_BYTES] = {"autoexclude-b1-bytes", required_argument, 0, 0},
+	[IDX_DEBUG_HOSTS] = {"debug-hosts", required_argument, 0, 0},
 	[IDX_NEW] = {"new", optional_argument, 0, 0},
 	[IDX_SKIP] = {"skip", no_argument, 0, 0},
 	[IDX_NAME] = {"name", required_argument, 0, 0},
@@ -3417,6 +3425,17 @@ int main(int argc, char **argv)
 				exit_clean(1);
 			}
 			break;
+		case IDX_AUTOEXCLUDE_B1_BYTES:
+			params.autoexclude_b1_bytes = atoi(optarg);
+			if (params.autoexclude_b1_bytes < 0 || params.autoexclude_b1_bytes > 10*1024*1024)
+			{
+				DLOG_ERR("autoexclude-b1-bytes must be within 0..10485760\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_DEBUG_HOSTS:
+			snprintf(params.debug_hosts_file, sizeof(params.debug_hosts_file), "%s", optarg);
+			break;
 		case IDX_AUTOEXCLUDE_MODE:
 			if (!strcmp(optarg,"hybrid"))
 				params.autoexclude_passive = false;
@@ -4083,6 +4102,8 @@ fmark_err:
 	}
 
 	ae_init();
+	dbg_hosts_set_default_file(params.debug_hosts_file);
+	dbg_hosts_load();
 
 	if (params.ctrack_disable)
 		DLOG_CONDUP("conntrack disabled ! some functions will not work. make sure it's what you want.\n");
