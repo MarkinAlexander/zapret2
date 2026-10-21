@@ -342,6 +342,10 @@ v0.9.4.3
 
 * nfqws2: more profile search optimizations
 
+1.0.6-reasm
+* nfqws2: fix TLS reasm desync on hardware fastpath routers
+* nfqws2: autodetect hw fastpath for TLS reasm
+
 1.0.6
 
 * zapret-lib: dissect quic tvb values that can't fit into 52-bit mantissa into raw strings
