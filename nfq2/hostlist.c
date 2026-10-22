@@ -115,8 +115,8 @@ bool AppendHostList(hostlist_pool **hostlist, const char *filename)
 	return true;
 }
 
-// bLoaded is set to true if the list was loaded and not set otherwise
-static bool LoadHostList(struct hostlist_file *hfile, bool *bLoaded)
+// bChanged is set to true if the list was changed and not set otherwise
+static bool LoadHostList(struct hostlist_file *hfile, bool *bChanged)
 {
 	if (hfile->filename)
 	{
@@ -134,6 +134,7 @@ static bool LoadHostList(struct hostlist_file *hfile, bool *bLoaded)
 			DLOG_PERROR("file_open_test");
 			goto unchanged;
 		}
+		if (bChanged) *bChanged=true;
 		// don't want to keep backup copy in memory - it will require *2 RAM. Problem on low-ram devices. It's better to fail hostlist read than have OOM.
 		// if a file can be opened there're few chances it can't be read. fs corruption, disk error, deleted or made inaccessible between 2 syscals ?
 		// it's all hypotetically possible but very unlikely. but OOM is much more real problem on an embedded device if list is large enough
@@ -144,21 +145,20 @@ static bool LoadHostList(struct hostlist_file *hfile, bool *bLoaded)
 			return false;
 		}
 		hfile->mod_sig=fsig;
-		if (bLoaded) *bLoaded=true;
 	}
 	return true;
 unchanged:
 	DLOG_ERR("cannot access hostlist file '%s'. in-memory content remains unchanged.\n",hfile->filename);
 	return true;
 }
-static bool LoadHostLists(struct hostlist_files_head *list, bool *bLoaded)
+static bool LoadHostLists(struct hostlist_files_head *list, bool *bChanged)
 {
 	bool bres=true;
 	struct hostlist_file *hfile;
 
 	LIST_FOREACH(hfile, list, next)
 	{
-		if (!LoadHostList(hfile, bLoaded))
+		if (!LoadHostList(hfile, bChanged))
 			// at least one failed
 			bres=false;
 	}
@@ -183,10 +183,10 @@ static void MakeAutolistsNonEmpty()
 
 bool LoadAllHostLists()
 {
-	bool bLoaded=false;
-	if (!LoadHostLists(&params.hostlists, &bLoaded))
+	bool bChanged=false;
+	if (!LoadHostLists(&params.hostlists, &bChanged))
 		return false;
-	if (bLoaded) MakeAutolistsNonEmpty();
+	if (bChanged) MakeAutolistsNonEmpty();
 	return true;
 }
 
@@ -230,15 +230,15 @@ static bool SearchHostList(hostlist_pool *hostlist, const char *host, bool no_ma
 static bool HostlistsReloadCheck(const struct hostlist_collection_head *hostlists)
 {
 	struct hostlist_item *item;
-	bool bLoaded=false;
+	bool bChanged=false;
 
 	LIST_FOREACH(item, hostlists, next)
 	{
-		if (!LoadHostList(item->hfile, &bLoaded))
+		if (!LoadHostList(item->hfile, &bChanged))
 			return false;
 	}
 	// this is relatively heavy function. walks through all the profiles. do not walk if no hostlists were releaded
-	if (bLoaded) MakeAutolistsNonEmpty();
+	if (bChanged) MakeAutolistsNonEmpty();
 	return true;
 }
 bool HostlistsReloadCheckForProfile(const struct desync_profile *dp)

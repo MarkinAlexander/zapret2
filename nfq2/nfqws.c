@@ -2270,8 +2270,8 @@ static void exithelp(void)
 		" --autoexclude-mode=<hybrid|passive>\t\t; passive never sends probe traffic (default : hybrid)\n"
 		"\nLUA PACKET PASS MODE:\n"
 		" --payload=type[,type]\t\t\t\t\t; set payload types following LUA functions should process : %s\n"
-		" --out-range=[(n|a|d|s|p)<int>](-|<)[(n|a|d|s|p)<int>]\t; set outgoing packet range for following LUA functions. '-' - include end pos, '<' - not include. prefix meaning : n - packet number, d - data packet number, s - relative sequence, p - data position relative sequence, b - byte count, x - never, a - always\n"
-		" --in-range=[(n|a|d|s|p)<int>](-|<)[(n|a|d|s|p)<int>]\t; set incoming packet range for following LUA functions. '-' - include end pos, '<' - not include. prefix meaning : n - packet number, d - data packet number, s - relative sequence, p - data position relative sequence, b - byte count, x - never, a - always\n"
+		" --out-range=<mode>[<int>][(-|<)<mode>[<int>]]\t\t; set outgoing packet range for following LUA functions. '-' - include end pos, '<' - not include. mode meaning : n - packet number, d - data packet number, s - relative sequence, p - data position relative sequence, b - byte count, x - never, a - always\n"
+		" --in-range=<mode>[<int>][(-|<)<mode>[<int>]]\t\t; set incoming packet range for following LUA functions. '-' - include end pos, '<' - not include. mode meaning : n - packet number, d - data packet number, s - relative sequence, p - data position relative sequence, b - byte count, x - never, a - always\n"
 		"\nLUA DESYNC ACTION:\n"
 		" --lua-desync=<functon>[:param1=val1[:param2=val2]]\t; call LUA function when packet received\n",
 #if defined(__linux__) || defined(SO_USER_COOKIE)
