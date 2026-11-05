@@ -354,6 +354,10 @@ v0.9.4.3
 * blockcheck2: request PACE-ing
 * blockcheck2: veryquick scan level
 
+1.0.7-reasm
+* nfqws2: fix TLS reasm desync on hardware fastpath routers
+* nfqws2: autodetect hw fastpath for TLS reasm
+
 1.0.7
 
 * zapret-obfs: support cgnat in udp2icmp
