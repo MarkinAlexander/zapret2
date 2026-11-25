@@ -377,3 +377,9 @@ v0.9.4.3
 * nfqws2: warn if not last profile is empty
 * zapret-auto: fix non-working stopif
 * zapret-lib: support ipv6 literals in dissect_url
+
+1.0.8-reasm
+
+* nfqws2: fix TLS reasm desync on hardware fastpath routers
+* nfqws2: autodetect hw fastpath for TLS reasm
+* nfqws2: do not load hostlists/ipsets contents in --dry-run
